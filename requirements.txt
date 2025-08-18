@@ -1,0 +1,10 @@
+torch>=1.9.0
+torchvision>=0.10.0
+Pillow>=8.0.0
+numpy>=1.20.0
+mss>=6.0.0
+pynput>=1.7.0
+tkinter
+
+# Note: PyTorch is required for the OLM neural pipeline
+# Install with CUDA support if available: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
