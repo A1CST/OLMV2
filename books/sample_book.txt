@@ -1,0 +1,10 @@
+The quick brown fox jumps over the lazy dog.
+This is a sample book for testing the OLM reading functionality.
+Reading is a fundamental skill that opens up new worlds of knowledge.
+The OLM system can now read books when it becomes bored and comfortable.
+Each line will be processed through the cognitive pipeline.
+The system will generate thoughts about what it reads.
+But it will not speak aloud during reading sessions.
+This helps the OLM learn and grow intellectually.
+Reading provides mental stimulation and reduces boredom.
+The end of this sample book.

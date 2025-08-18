@@ -219,6 +219,83 @@ class App:
                                     relief='flat', bd=0,
                                     width=10, height=2)
         self.wipe_button.pack(side='right', padx=(5, 0))
+        
+        # Reading button frame (separate from main controls)
+        reading_frame = tk.Frame(sidebar_frame, bg='#2b2b2b')
+        reading_frame.pack(fill='x', padx=10, pady=(5, 10))
+        
+        # Reading button
+        self.reading_button = tk.Button(reading_frame, text="📖 Start Reading", 
+                                       bg='#9C27B0', fg='white',
+                                       font=('Arial', 12, 'bold'),
+                                       command=self.start_reading_session,
+                                       relief='flat', bd=0,
+                                       width=15, height=2,
+                                       state='disabled')  # Initially disabled
+        self.reading_button.pack(fill='x')
+        
+        # Reading constraints labels frame
+        constraints_frame = tk.Frame(reading_frame, bg='#2b2b2b')
+        constraints_frame.pack(fill='x', pady=(5, 0))
+        
+        # Constraints title
+        constraints_title = tk.Label(constraints_frame, text="Reading Constraints:", 
+                                   bg='#2b2b2b', fg='white', 
+                                   font=('Arial', 9, 'bold'))
+        constraints_title.pack(anchor='w', pady=(0, 2))
+        
+        # Individual constraint labels
+        self.boredom_constraint_label = tk.Label(constraints_frame, 
+                                               text="Boredom > 80: 0.0", 
+                                               bg='#2b2b2b', fg='#FF0000',  # Red initially
+                                               font=('Consolas', 8))
+        self.boredom_constraint_label.pack(anchor='w')
+        
+        self.comfort_constraint_label = tk.Label(constraints_frame, 
+                                               text="Comfort > 70: 0.0", 
+                                               bg='#2b2b2b', fg='#FF0000',  # Red initially
+                                               font=('Consolas', 8))
+        self.comfort_constraint_label.pack(anchor='w')
+        
+        self.novelty_constraint_label = tk.Label(constraints_frame, 
+                                               text="Novelty < 0.001: 0.0", 
+                                               bg='#2b2b2b', fg='#FF0000',  # Red initially
+                                               font=('Consolas', 8))
+        self.novelty_constraint_label.pack(anchor='w')
+        
+        # Token counter frame
+        token_frame = tk.Frame(sidebar_frame, bg='#2b2b2b')
+        token_frame.pack(fill='x', padx=10, pady=(10, 5))
+        
+        # Token counter label
+        token_label = tk.Label(token_frame, text="Token Counter", 
+                             bg='#2b2b2b', fg='white', 
+                             font=('Arial', 10, 'bold'))
+        token_label.pack(anchor='w', pady=(0, 5))
+        
+        # Token counter display
+        self.token_counter_label = tk.Label(token_frame, 
+                                          text="Vocabulary Size: 0\n"
+                                               "Total Tokens: 0\n"
+                                               "Last Tokens: None",
+                                          bg='#1e1e1e', fg='#00FFFF',  # Cyan text for tokens
+                                          font=('Consolas', 10, 'bold'),
+                                          justify=tk.LEFT, anchor='nw',
+                                          relief='solid', bd=1)
+        self.token_counter_label.pack(fill='x', pady=(0, 5))
+        
+        # Print log button frame
+        log_frame = tk.Frame(sidebar_frame, bg='#2b2b2b')
+        log_frame.pack(fill='x', padx=10, pady=(5, 10))
+        
+        # Print log button
+        self.print_log_button = tk.Button(log_frame, text="📄 Print Log", 
+                                         bg='#607D8B', fg='white',
+                                         font=('Arial', 12, 'bold'),
+                                         command=self.print_log_report,
+                                         relief='flat', bd=0,
+                                         width=15, height=2)
+        self.print_log_button.pack(fill='x')
 
     def setup_olm_dialog_section(self):
         """Create a large dialog container showing only OLM speech/messages."""
@@ -560,6 +637,9 @@ class App:
                 f"Boredom: {boredom:.1f}"
             )
             self.status_label.config(text=status_text)
+            
+            # Update reading button state
+            self.update_reading_button_state(internal_state)
         except Exception as e:
             self.log_system(f"Error updating internal state panel: {e}")
     
@@ -642,6 +722,65 @@ class App:
             self.engine.wipe_checkpoints()
         else:
             self.log_system("ERROR: No engine connected!")
+    
+    def start_reading_session(self):
+        """Manually start a reading session"""
+        if self.engine:
+            self.log_system("Reading button clicked - starting reading session")
+            self.engine._start_reading_session()
+        else:
+            self.log_system("ERROR: No engine connected!")
+    
+    def update_reading_button_state(self, internal_state):
+        """Update the reading button state based on internal state constraints"""
+        if not self.engine:
+            return
+        
+        # Check if the engine is in a state where reading can be triggered
+        if (self.engine.is_sleeping or self.engine.is_reading):
+            # Disable button if sleeping or already reading
+            self.reading_button.config(state='disabled', bg='#666666')
+            return
+        
+        # Check the reading constraints
+        boredom = internal_state.get('Boredom', 0.0)
+        comfort = internal_state.get('Comfort', 0.0)
+        novelty = internal_state.get('Novelty', 0.0)
+        
+        # Update constraint labels with current values and colors
+        # Boredom constraint: > 80
+        boredom_met = boredom > 80
+        boredom_color = '#00FF00' if boredom_met else '#FF0000'  # Green if met, red if not
+        self.boredom_constraint_label.config(
+            text=f"Boredom > 80: {boredom:.1f}",
+            fg=boredom_color
+        )
+        
+        # Comfort constraint: > 70
+        comfort_met = comfort > 70
+        comfort_color = '#00FF00' if comfort_met else '#FF0000'  # Green if met, red if not
+        self.comfort_constraint_label.config(
+            text=f"Comfort > 70: {comfort:.1f}",
+            fg=comfort_color
+        )
+        
+        # Novelty constraint: < 0.001
+        novelty_met = novelty < 0.001
+        novelty_color = '#00FF00' if novelty_met else '#FF0000'  # Green if met, red if not
+        self.novelty_constraint_label.config(
+            text=f"Novelty < 0.001: {novelty:.6f}",
+            fg=novelty_color
+        )
+        
+        # Reading constraints: Boredom > 80, Comfort > 70, Novelty < 0.001
+        constraints_met = (boredom_met and comfort_met and novelty_met)
+        
+        if constraints_met:
+            # Enable button with purple color
+            self.reading_button.config(state='normal', bg='#9C27B0')
+        else:
+            # Disable button with gray color
+            self.reading_button.config(state='disabled', bg='#666666')
             
     def send_user_message(self):
         """Send a user message to the engine's text handler"""
@@ -663,6 +802,178 @@ class App:
                 self.log_system("Attempted to send empty message - ignored")
         else:
             self.log_system("ERROR: No engine connected!")
+    
+    def update_token_counter(self, vocabulary_size=None, total_tokens=None, last_tokens=None):
+        """Update the token counter display with current tokenizer statistics"""
+        if vocabulary_size is None and self.engine and hasattr(self.engine, 'tokenizer'):
+            vocabulary_size = self.engine.tokenizer.get_vocabulary_size()
+        
+        if total_tokens is None and self.engine and hasattr(self.engine, 'tokenizer'):
+            # Count total tokens in vocabulary
+            total_tokens = sum(self.engine.tokenizer.word_to_token.values()) if hasattr(self.engine.tokenizer, 'word_to_token') else 0
+        
+        if last_tokens is None and self.engine and hasattr(self.engine, 'last_olm_speech_tokens'):
+            last_tokens = self.engine.last_olm_speech_tokens[-10:] if self.engine.last_olm_speech_tokens else []  # Last 10 tokens
+        
+        # Format the display text
+        vocab_text = f"Vocabulary Size: {vocabulary_size}" if vocabulary_size is not None else "Vocabulary Size: 0"
+        total_text = f"Total Tokens: {total_tokens}" if total_tokens is not None else "Total Tokens: 0"
+        
+        if last_tokens:
+            last_tokens_text = f"Last Tokens: {last_tokens}"
+        else:
+            last_tokens_text = "Last Tokens: None"
+        
+        self.token_counter_label.config(text=f"{vocab_text}\n{total_text}\n{last_tokens_text}")
+    
+    def print_log_report(self):
+        """Generate and save a comprehensive log report for the current tick"""
+        if not self.engine:
+            self.log_system("ERROR: No engine connected!")
+            return
+        
+        try:
+            import os
+            import datetime
+            
+            # Create logs directory if it doesn't exist
+            logs_dir = "logs"
+            if not os.path.exists(logs_dir):
+                os.makedirs(logs_dir)
+                self.log_system(f"Created logs directory: {logs_dir}")
+            
+            # Generate timestamp for filename
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"olm_report_{timestamp}.txt"
+            filepath = os.path.join(logs_dir, filename)
+            
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write("=" * 80 + "\n")
+                f.write("OLM SYSTEM REPORT\n")
+                f.write("=" * 80 + "\n")
+                f.write(f"Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"Tick Count: {getattr(self.engine, 'tick_count', 'Unknown')}\n\n")
+                
+                # Internal State Section
+                f.write("-" * 40 + "\n")
+                f.write("INTERNAL STATE\n")
+                f.write("-" * 40 + "\n")
+                for key, value in self.engine.internal_state.items():
+                    f.write(f"{key}: {value}\n")
+                f.write(f"Sleeping: {self.engine.is_sleeping}\n")
+                f.write(f"Reading: {self.engine.is_reading}\n")
+                f.write(f"Energy: {self.engine.internal_state.get('Energy', 'Unknown')}\n\n")
+                
+                # Sensory Packet Section
+                f.write("-" * 40 + "\n")
+                f.write("CURRENT SENSORY PACKET\n")
+                f.write("-" * 40 + "\n")
+                if hasattr(self.engine, 'current_sensory_packet'):
+                    for key, value in self.engine.current_sensory_packet.items():
+                        if key == 'text' and isinstance(value, dict) and 'text' in value:
+                            # Handle tokenized text specially
+                            tokens = value['text']
+                            if isinstance(tokens, list):
+                                f.write(f"Text ({value.get('source', 'unknown')}): {len(tokens)} tokens\n")
+                                f.write(f"  Tokens: {tokens}\n")
+                            else:
+                                f.write(f"Text ({value.get('source', 'unknown')}): {tokens}\n")
+                        elif key == 'vision' and isinstance(value, dict):
+                            f.write(f"Vision: {value.get('image_size', 'Unknown size')}\n")
+                        elif key == 'keyboard' and isinstance(value, dict):
+                            events = value.get('events', [])
+                            f.write(f"Keyboard: {len(events)} events\n")
+                        elif key == 'lsh_hash':
+                            f.write(f"LSH Hash: {value[:16]}...\n")
+                        else:
+                            f.write(f"{key}: {value}\n")
+                else:
+                    f.write("No sensory packet available\n")
+                f.write("\n")
+                
+                # Tokenizer Section
+                f.write("-" * 40 + "\n")
+                f.write("TOKENIZER STATISTICS\n")
+                f.write("-" * 40 + "\n")
+                if hasattr(self.engine, 'tokenizer'):
+                    vocab_size = self.engine.tokenizer.get_vocabulary_size()
+                    f.write(f"Vocabulary Size: {vocab_size}\n")
+                    f.write(f"Last Speech Tokens: {getattr(self.engine, 'last_olm_speech_tokens', [])}\n")
+                    
+                    # Show some sample vocabulary entries
+                    if hasattr(self.engine.tokenizer, 'word_to_token'):
+                        sample_words = list(self.engine.tokenizer.word_to_token.keys())[:20]
+                        f.write(f"Sample Vocabulary: {sample_words}\n")
+                else:
+                    f.write("No tokenizer available\n")
+                f.write("\n")
+                
+                # Thought History Section
+                f.write("-" * 40 + "\n")
+                f.write("THOUGHT HISTORY\n")
+                f.write("-" * 40 + "\n")
+                if hasattr(self.engine, 'thought_history'):
+                    f.write(f"Thought History Length: {len(self.engine.thought_history)}\n")
+                    f.write(f"Consecutive Similar Thoughts: {getattr(self.engine, 'consecutive_similar_thoughts', 0)}\n")
+                else:
+                    f.write("No thought history available\n")
+                f.write("\n")
+                
+                # Experience Buffer Section
+                f.write("-" * 40 + "\n")
+                f.write("EXPERIENCE BUFFER\n")
+                f.write("-" * 40 + "\n")
+                if hasattr(self.engine, 'experience_buffer'):
+                    f.write(f"Experience Buffer Size: {len(self.engine.experience_buffer)}\n")
+                    f.write(f"Max Buffer Size: {getattr(self.engine, 'experience_buffer_max_size', 'Unknown')}\n")
+                else:
+                    f.write("No experience buffer available\n")
+                f.write("\n")
+                
+                # Hash Database Section
+                f.write("-" * 40 + "\n")
+                f.write("HASH DATABASE\n")
+                f.write("-" * 40 + "\n")
+                if hasattr(self.engine, 'hash_db'):
+                    f.write(f"Total Hashes: {len(self.engine.hash_db.hash_to_id)}\n")
+                    f.write(f"Last Hash: {getattr(self.engine, 'last_tick_hash', 'None')}\n")
+                else:
+                    f.write("No hash database available\n")
+                f.write("\n")
+                
+                # Prediction Section
+                f.write("-" * 40 + "\n")
+                f.write("PREDICTION STATE\n")
+                f.write("-" * 40 + "\n")
+                if hasattr(self.engine, 'prediction_from_previous_tick'):
+                    if self.engine.prediction_from_previous_tick is not None:
+                        f.write(f"Previous Prediction Shape: {self.engine.prediction_from_previous_tick.shape}\n")
+                        f.write(f"Previous Prediction Mean: {self.engine.prediction_from_previous_tick.mean():.6f}\n")
+                    else:
+                        f.write("No previous prediction available\n")
+                else:
+                    f.write("No prediction state available\n")
+                f.write("\n")
+                
+                # Reading State Section
+                if self.engine.is_reading:
+                    f.write("-" * 40 + "\n")
+                    f.write("READING STATE\n")
+                    f.write("-" * 40 + "\n")
+                    f.write(f"Current Book: {getattr(self.engine, 'current_book_path', 'Unknown')}\n")
+                    f.write(f"Book File Open: {getattr(self.engine, 'current_book_file', None) is not None}\n")
+                    f.write("\n")
+                
+                f.write("=" * 80 + "\n")
+                f.write("END OF REPORT\n")
+                f.write("=" * 80 + "\n")
+            
+            self.log_system(f"Log report saved to: {filepath}")
+            
+        except Exception as e:
+            error_msg = f"Error generating log report: {str(e)}"
+            self.log_system(error_msg)
+            print(error_msg)
             
     def on_closing(self):
         """Handle window closing"""
