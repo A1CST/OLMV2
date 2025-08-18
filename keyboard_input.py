@@ -3,6 +3,9 @@ import threading
 import time
 import queue
 
+# Configuration constants
+HOLD_THRESHOLD = 0.2  # Minimum duration (seconds) to consider a key as "held"
+
 class KeyboardListener:
     def __init__(self, pause_threshold=1.0):
         """
@@ -49,11 +52,13 @@ class KeyboardListener:
             current_time = time.time()
             self.held_keys[key_str] = current_time
             
+            # Calculate time since last event before updating activity time
+            time_since_last = current_time - self.last_activity_time if self.event_buffer else 0
+            
             # Update last activity time
             self.last_activity_time = current_time
             
             # Add press event to buffer
-            time_since_last = current_time - self.last_activity_time if self.event_buffer else 0
             self.event_buffer.append({
                 'type': 'press',
                 'key': key_str,
@@ -81,7 +86,7 @@ class KeyboardListener:
                 hold_duration = current_time - press_time
                 
                 # If hold duration is significant, add a hold event
-                if hold_duration > 0.2:  # 200ms threshold for "hold"
+                if hold_duration > HOLD_THRESHOLD:
                     self.event_buffer.append({
                         'type': 'hold',
                         'key': key_str,

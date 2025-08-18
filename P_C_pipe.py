@@ -69,6 +69,11 @@ class NeurotransmitterActivator:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model.to(self.device)
         self.pattern_buffer = deque(maxlen=LSTM2_TEMPORAL_WINDOW_SIZE)
+        
+        # Setup for training
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=0.001)
+        self.criterion = nn.MSELoss()
+        self.last_input_for_training = None
 
     def process(self, pattern_input_vector): # MODIFIED: Takes vector as argument
         pattern_input = torch.tensor(pattern_input_vector, dtype=torch.float32, device=self.device)
@@ -82,8 +87,63 @@ class NeurotransmitterActivator:
             batched_input = torch.stack(list(self.pattern_buffer))
         
         batched_input = batched_input.unsqueeze(0)
+        
+        # Store the input tensor for the subsequent training step
+        self.last_input_for_training = batched_input
 
         with torch.no_grad():
             neurotransmitter_output = self.model(batched_input)
 
         return neurotransmitter_output.cpu().numpy().flatten().astype(np.float32)
+        
+    def train(self, target_vector):
+        """
+        Trains the C-LSTM for one step.
+        """
+        if self.last_input_for_training is None:
+            return None
+
+        self.model.train()
+
+        target_tensor = torch.tensor(target_vector, dtype=torch.float32, device=self.device).unsqueeze(0)
+
+        self.optimizer.zero_grad()
+        prediction = self.model(self.last_input_for_training)
+        loss = self.criterion(prediction, target_tensor)
+        loss.backward()
+        self.optimizer.step()
+
+        self.model.eval()
+        return loss.item()
+        
+    def train_with_input(self, input_vector, target_vector):
+        """
+        Trains the C-LSTM with explicit input and target vectors.
+        """
+        self.model.train()
+
+        # Create a temporal buffer for the input (same as in process method)
+        pattern_input = torch.tensor(input_vector, dtype=torch.float32, device=self.device)
+        
+        # Create a temporary buffer for training
+        temp_buffer = deque(maxlen=LSTM2_TEMPORAL_WINDOW_SIZE)
+        temp_buffer.append(pattern_input)
+        
+        if len(temp_buffer) < LSTM2_TEMPORAL_WINDOW_SIZE:
+            padding_needed = LSTM2_TEMPORAL_WINDOW_SIZE - len(temp_buffer)
+            padded_buffer = [torch.zeros_like(pattern_input)] * padding_needed + list(temp_buffer)
+            batched_input = torch.stack(padded_buffer)
+        else:
+            batched_input = torch.stack(list(temp_buffer))
+        
+        batched_input = batched_input.unsqueeze(0)
+        target_tensor = torch.tensor(target_vector, dtype=torch.float32, device=self.device).unsqueeze(0)
+
+        self.optimizer.zero_grad()
+        prediction = self.model(batched_input)
+        loss = self.criterion(prediction, target_tensor)
+        loss.backward()
+        self.optimizer.step()
+
+        self.model.eval()
+        return loss.item()

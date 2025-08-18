@@ -219,21 +219,20 @@ class App:
         self.wipe_button.pack(side='right', padx=(5, 0))
         
     def setup_bottom_section(self):
-        """Create the bottom section with six log panels"""
+        """Create the bottom section with five log panels"""
         # Bottom container
         bottom_frame = tk.Frame(self.root, bg='#2b2b2b')
         bottom_frame.grid(row=1, column=0, columnspan=2, sticky='ew', padx=10, pady=(0, 10))
         
-        # Configure grid weights for six columns
+        # Configure grid weights for five columns
         bottom_frame.grid_columnconfigure(0, weight=1)
         bottom_frame.grid_columnconfigure(1, weight=1)
         bottom_frame.grid_columnconfigure(2, weight=1)
         bottom_frame.grid_columnconfigure(3, weight=1)
         bottom_frame.grid_columnconfigure(4, weight=1)
-        bottom_frame.grid_columnconfigure(5, weight=1)
         
-        # Action Log (left)
-        self.setup_log_panel(bottom_frame, "Action Log", 0, "action_log")
+        # Speech Log (left)
+        self.setup_log_panel(bottom_frame, "Speech Log", 0, "speech_log")
         
         # System Log (middle-left)
         self.setup_log_panel(bottom_frame, "System Log", 1, "system_log")
@@ -241,21 +240,18 @@ class App:
         # Console Log (middle)
         self.setup_log_panel(bottom_frame, "Console Log", 2, "console_log")
         
-        # Sensory Packet Log (middle-right)
-        self.setup_log_panel(bottom_frame, "Sensory Packet Log", 3, "sensory_log")
-        
         # Internal Thoughts Log (right)
-        self.setup_log_panel(bottom_frame, "Internal Thoughts", 4, "thoughts_log")
+        self.setup_log_panel(bottom_frame, "Internal Thoughts", 3, "thoughts_log")
         
-        # Speech Log (far right)
-        self.setup_log_panel(bottom_frame, "Speech", 5, "speech_log")
+        # Sensory Packet Log (far right)
+        self.setup_log_panel(bottom_frame, "Sensory Packet Log", 4, "sensory_log")
         
     def setup_log_panel(self, parent, title, column, attr_name):
         """Helper method to create a log panel"""
         # Container for this log
         log_container = tk.Frame(parent, bg='#2b2b2b')
         # Add padding between panels, but not after the last one
-        if column < 5:  # All but the last column
+        if column < 4:  # All but the last column
             log_container.grid(row=0, column=column, sticky='nsew', padx=(0, 5))
         else:  # Last column
             log_container.grid(row=0, column=column, sticky='nsew', padx=(0, 0))
@@ -513,8 +509,8 @@ class App:
         self.update_tps(0)
         
     def log_action(self, action_text):
-        """Add an action to the action log"""
-        self._add_to_log(self.action_log, action_text)
+        """Add an action to the speech log (since action log was replaced)"""
+        self._add_to_log(self.speech_log, action_text)
         
     def log_system(self, system_text):
         """Add a system message to the system log"""
@@ -535,6 +531,8 @@ class App:
     def log_speech(self, speech_text):
         """Add speech output to the speech log"""
         self._add_to_log(self.speech_log, speech_text)
+        
+
         
     def _add_to_log(self, text_widget, message):
         """Helper method to add a message to any log widget"""

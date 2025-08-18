@@ -13,6 +13,12 @@ from P_C_pipe import PatternRecognizer, NeurotransmitterActivator
 from D_pipe import ThoughtD_LSTM, TextD_LSTM
 from hash_info_db import HashInfoDB
 
+# Configuration constants
+VISION_CAPTURE_INTERVAL = 10  # Capture screen every N ticks
+CHECKPOINT_SAVE_INTERVAL = 200  # Save checkpoints every N ticks
+PACKET_SUMMARY_INTERVAL = 20  # Log sensory packet summary every N ticks
+STABILIZATION_THRESHOLD = 0.1  # Threshold for calibration stabilization (10%)
+
 class Engine:
     def __init__(self, gui=None):
         """Initialize the engine with a reference to the GUI"""
@@ -144,6 +150,66 @@ class Engine:
         
         return sensory_vector
         
+    def _calibrate_new_hash(self, neuro_vector):
+        """
+        Performs a one-time calibration for a new hash to find optimal depths.
+        
+        Args:
+            neuro_vector (numpy.ndarray): Neurotransmitter vector to calibrate with
+            
+        Returns:
+            dict: Calibrated depths dictionary with 'optimal', 'streamlined', 'deep' keys
+        """
+        # Validate input
+        if neuro_vector is None or len(neuro_vector) == 0:
+            if self.gui:
+                self.gui.log_system("Error: Invalid neuro_vector for calibration")
+            return {'optimal': 4, 'streamlined': 2, 'deep': 8}  # Safe defaults
+        if self.gui:
+            self.gui.log_system("--- Starting D-LSTM Calibration ---")
+
+        output_vectors = []
+        max_depth = self.text_d_lstm.get_max_depth()
+
+        for depth in range(1, max_depth + 1):
+            # We only need to calibrate one of the D-LSTMs as they share an architecture
+            vector = self.text_d_lstm.process(neuro_vector, self.internal_state, depth=depth)
+            output_vectors.append(vector)
+            if self.gui:
+                self.gui.log_system(f"  Depth {depth}/{max_depth}: Output Mean = {vector.mean():.6f}")
+
+        # Find where the output stabilizes
+        # Since layers have different output sizes, we'll use a simpler heuristic
+        # Look for the point where the output magnitude stabilizes
+        optimal_depth = max_depth
+        if len(output_vectors) > 1:
+            # Calculate the magnitude of each output vector
+            magnitudes = [np.linalg.norm(vec) for vec in output_vectors]
+            
+            # Find where the magnitude change becomes small
+            stabilization_threshold = STABILIZATION_THRESHOLD
+            for i in range(1, len(magnitudes)):
+                if magnitudes[i] > 0 and magnitudes[i-1] > 0:  # Prevent division by zero
+                    change_ratio = abs(magnitudes[i] - magnitudes[i-1]) / magnitudes[i-1]
+                    if change_ratio < stabilization_threshold:
+                        optimal_depth = i + 1  # Use the depth that produced the stable magnitude
+                        break
+
+        # For now, streamlined and deep are placeholders based on optimal
+        streamlined_depth = max(1, optimal_depth // 2)
+
+        calibrated_depths = {
+            'optimal': optimal_depth,
+            'streamlined': streamlined_depth,
+            'deep': max_depth
+        }
+
+        if self.gui:
+            self.gui.log_system(f"--- Calibration Complete ---")
+            self.gui.log_system(f"  > Optimal Depth Found: {optimal_depth}")
+
+        return calibrated_depths
+        
     def start(self):
         """Start the engine in a separate thread"""
         if not self.running:
@@ -236,9 +302,9 @@ class Engine:
                     print(f"Keyboard utterance received with {len(keyboard_utterance['events'])} events.")
                 # TODO: Package keyboard_utterance into the main sensory snapshot
             
-            # Check if we should capture screen (every 10 ticks)
+            # Check if we should capture screen
             vision_data = None
-            if tick_count % 10 == 0:
+            if tick_count % VISION_CAPTURE_INTERVAL == 0:
                 try:
                     # Capture screen frame
                     captured_image = self.capturer.capture_frame()
@@ -376,21 +442,13 @@ class Engine:
             if current_hash:
                 hash_id, hash_info, is_new = self.hash_db.get_or_create_hash_info(current_hash)
 
-                # ONE-TIME CALIBRATION FOR NEW HASHES
-                if is_new:
-                    if self.gui:
-                        self.gui.log_system(f"New hash {hash_id} discovered! Calibrating...")
-                    # TODO: Implement the one-time calibration logic here.
-                    # This involves creating a temporary neuro_vector and passing it
-                    # through the D-LSTM at cascading depths to find the optimal depth.
-                    # For now, we'll set placeholder depths.
-                    placeholder_depths = {'optimal': 6, 'streamlined': 2, 'deep': 8}
-                    self.hash_db.update_depths(hash_id, placeholder_depths)
+                # Placeholder for depths, will be calibrated in the main pipeline if new
+                optimal_depth = hash_info.get('optimal_depth')
 
                 # Store the current internal state *before* the next action is taken
                 self.state_before_action = self.internal_state.copy()
             
-            # --- Main OLM Pipeline ---
+                        # --- Main OLM Pipeline ---
             if 'vision' in self.current_sensory_packet or 'text' in self.current_sensory_packet or 'keyboard' in self.current_sensory_packet:
                 # 1. P-LSTM: Discover patterns from the sensory vector
                 pattern_vector = self.pattern_recognizer.process(current_sensory_vector)
@@ -398,37 +456,51 @@ class Engine:
                 # 2. C-LSTM: Compress patterns into a neurotransmitter vector
                 neuro_vector = self.neuro_activator.process(pattern_vector)
 
-                # 3. D-LSTMs: Generate internal thought and external text output
-                
-                # Get the optimal processing depth for the current state
-                optimal_depth = None
-                if current_hash and 'hash_info' in locals():
-                    optimal_depth = hash_info.get('optimal_depth')
+                # >> C-LSTM Training Step <<
+                # Train the Neuro Activator to better represent the current pattern vector.
+                c_loss = self.neuro_activator.train_with_input(pattern_vector, neuro_vector)
+                if self.gui and c_loss is not None:
+                    self.gui.log_system(f"C-LSTM Training... Loss: {c_loss:.6f}")
 
-                # 3a. Process internal thought
+                # 3. Check if calibration is needed for the current hash
+                if is_new:
+                    # Calibrate to find the best depths and save them
+                    calibrated_depths = self._calibrate_new_hash(neuro_vector)
+                    self.hash_db.update_depths(hash_id, calibrated_depths)
+                    optimal_depth = calibrated_depths['optimal']
+
+                # Log which depth is being used for this tick
+                if self.gui:
+                    log_msg = f"Using stored depth: {optimal_depth}" if not is_new else f"Using newly calibrated depth: {optimal_depth}"
+                    self.gui.log_system(log_msg)
+
+                # 4. D-LSTMs: Generate thought and text using the determined depth
                 thought_vector = self.thought_d_lstm.process(neuro_vector, self.internal_state, depth=optimal_depth)
-                # Convert vector to integer tokens and then to text
+                text_vector = self.text_d_lstm.process(neuro_vector, self.internal_state, depth=optimal_depth)
+
+                # >> D-LSTMs Training Step <<
+                # Train the D-LSTMs to better reflect the current neuro_vector.
+                # This is a simple starting point for training.
+                t_loss = self.thought_d_lstm.train(neuro_vector, neuro_vector, optimal_depth)
+                s_loss = self.text_d_lstm.train(neuro_vector, neuro_vector, optimal_depth)
+                if self.gui and t_loss is not None:
+                    self.gui.log_system(f"D-LSTM Training... Thought Loss: {t_loss:.6f}, Speech Loss: {s_loss:.6f}")
+
+                # 5. De-tokenize and route the outputs
                 thought_tokens = np.round(thought_vector).astype(int)
                 thought_text = self.tokenizer.detokenize(thought_tokens)
 
-                # 3b. Process external text output
-                text_vector = self.text_d_lstm.process(neuro_vector, self.internal_state, depth=optimal_depth)
-                # Convert vector to integer tokens and then to text
                 output_tokens = np.round(text_vector).astype(int)
                 output_text = self.tokenizer.detokenize(output_tokens)
 
-                # 4. Log and route the outputs
                 if self.gui:
                     self.gui.log_thoughts(thought_text)
                     self.gui.log_speech(output_text)
 
-                # Feed the external output back into the system for the next tick
                 self.text_handler.add_message(output_text, source='olm')
-
-                # TODO: Pass the external output to the TinyLlama model
             
             # Periodically save tokenizer state to persist vocabulary growth
-            if tick_count % 200 == 0:
+            if tick_count % CHECKPOINT_SAVE_INTERVAL == 0:
                 self.tokenizer.save_state()
                 # Also save the prediction model state
                 predictor_checkpoint_file = os.path.join(self.checkpoints_dir, "prediction_model.pth")
@@ -436,8 +508,8 @@ class Engine:
                 if self.gui:
                     self.gui.log_system("Periodically saved prediction model.")
 
-            # Log sensory packet summary every 20 ticks
-            if tick_count % 20 == 0 and self.gui:
+            # Log sensory packet summary periodically
+            if tick_count % PACKET_SUMMARY_INTERVAL == 0 and self.gui:
                 summary_parts = []
                 
                 if 'vision' in self.current_sensory_packet:
