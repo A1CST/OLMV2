@@ -85,7 +85,9 @@ class CustomTokenizer:
                 word = self.token_to_word[token]
             else:
                 # Use unknown token as fallback
-                word = self.token_to_word.get(0, '<unk>')  # Default to first token if available
+                # We suppress explicit '<unk>' text in outputs by skipping unresolved tokens
+                # If you prefer to keep a placeholder, change to: word = '<unk>'
+                continue
             
             words.append(word)
         

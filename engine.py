@@ -1,6 +1,7 @@
 import threading
 import time
 import os
+import random
 import numpy as np
 from screen_capture import ScreenCapturer
 from beta_vae import BetaVAE
@@ -104,6 +105,10 @@ class Engine:
         # Sleep state management
         self.is_sleeping = False
         self.sleep_ticks_remaining = 0
+        
+        # Experience replay buffer for sleep cycle
+        self.experience_buffer = []
+        self.experience_buffer_max_size = 1000 # Store the last ~50 seconds of experience
         
         # Track OLM's last spoken tokens for sensory awareness
         self.last_olm_speech_tokens = []
@@ -310,9 +315,25 @@ class Engine:
                 # TODO: Implement bulk training via replay and hallucination here
                 # Example: self.predictor.train_on_replayed_experience()
 
-                # Generate internal thoughts at a higher temperature for exploration
-                random_neuro_vector = np.random.randn(64).astype(np.float32)
-                thought_vector = self.thought_d_lstm.process(random_neuro_vector, self.internal_state, temperature=1.5)
+                # Dream by re-processing a random experience from the wake cycle
+                dream_neuro_vector = np.random.randn(64).astype(np.float32) # Default to random
+                if self.experience_buffer:
+                    try:
+                        # Pick a random sensory vector from the buffer
+                        random_experience_vector = random.choice(self.experience_buffer)
+
+                        if self.gui: self.gui.log_system(f"Dreaming, seeded by a random experience.")
+
+                        # Re-process the experience to generate a neuro_vector for the dream
+                        dream_pattern_vector = self.pattern_recognizer.process(random_experience_vector)
+                        dream_neuro_vector = self.neuro_activator.process(dream_pattern_vector)
+                    except Exception as e:
+                        if self.gui:
+                            self.gui.log_system(f"Dream processing error: {e}, using random vector")
+                        # Fall back to random vector if processing fails
+                        dream_neuro_vector = np.random.randn(64).astype(np.float32)
+
+                thought_vector = self.thought_d_lstm.process(dream_neuro_vector, self.internal_state, temperature=1.5)
                 thought_tokens = np.round(thought_vector).astype(int)
                 thought_text = self.tokenizer.detokenize(thought_tokens)
                 if self.gui:
@@ -326,36 +347,50 @@ class Engine:
                         self.gui.log_system("Waking up. Energy replenished.")
                         self.gui.update_internal_state(self.internal_state, self.is_sleeping)
 
+                # Update tick count and TPS even during sleep
+                tick_count += 1
+                if self.gui:
+                    self.gui.update_tps(tick_count)
+                    self.gui.log_console(f"Sleep Tick! #{tick_count}")
+
                 # Sleep for the standard tick duration and skip the wake cycle work
-                time.sleep(1.0 / self.tick_rate)
+                # Use a shorter sleep to keep GUI responsive
+                time.sleep(0.05)  # 50ms instead of full tick duration
+                
+                # Force GUI update to prevent freezing
+                if self.gui:
+                    try:
+                        self.gui.root.update_idletasks()
+                    except:
+                        pass
                 continue
 
             # --- WAKE CYCLE LOGIC ---
             
-            # Check for new text input
+            # --- Collect and Process Sensory Inputs ---
+            self.current_sensory_packet = {}  # Reset packet for this tick
+
+            # Check for new text input from any source
             text_input = self.text_handler.get_latest_input()
             if text_input is not None:
-                # Tokenize the text input
                 original_text = text_input['text']
+                # Tokenize the text, which also adds new words to the vocabulary
                 tokenized_text = self.tokenizer.tokenize(original_text)
-                
-                # Replace raw text with tokenized version
-                text_input['text'] = tokenized_text
-                
+
+                # Add to the sensory packet
+                self.current_sensory_packet['text'] = {
+                    'source': text_input['source'],
+                    'text': tokenized_text
+                }
                 if self.gui:
-                    self.gui.log_system(f"Text input received from [{text_input['source']}]: '{original_text}' -> tokens: {tokenized_text}")
-                else:
-                    print(f"Text input received from [{text_input['source']}]: '{original_text}' -> tokens: {tokenized_text}")
-                # TODO: Package text_input into the main sensory snapshot
-            
+                    self.gui.log_system(f"Text input from [{text_input['source']}] tokenized.")
+
             # Check for new keyboard input
             keyboard_utterance = self.keyboard_listener.get_latest_utterance()
             if keyboard_utterance is not None:
+                self.current_sensory_packet['keyboard'] = keyboard_utterance
                 if self.gui:
-                    self.gui.log_system(f"Keyboard utterance received with {len(keyboard_utterance['events'])} events.")
-                else:
-                    print(f"Keyboard utterance received with {len(keyboard_utterance['events'])} events.")
-                # TODO: Package keyboard_utterance into the main sensory snapshot
+                    self.gui.log_system(f"Keyboard utterance captured.")
             
             # Check if we should capture screen
             vision_data = None
@@ -382,11 +417,12 @@ class Engine:
                     if self.gui:
                         self.gui.update_vision(captured_image)
                     
-                    # Store vision data for sensory packet
+                    # Store vision data for sensory packet immediately
                     vision_data = {
                         'latent_vector': latent_vector,
                         'image_size': captured_image.size
                     }
+                    self.current_sensory_packet['vision'] = vision_data
                         
                 except Exception as e:
                     error_msg = f"Error capturing screen at tick {tick_count}: {str(e)}"
@@ -395,22 +431,7 @@ class Engine:
                     else:
                         print(error_msg)
             
-            # Accumulate sensory data in persistent packet
-            # Add vision data if available (from screen capture)
-            if vision_data is not None:
-                self.current_sensory_packet['vision'] = vision_data
-            
-            # Add text input if available
-            if text_input is not None:
-                self.current_sensory_packet['text'] = text_input
-                if self.gui:
-                    self.gui.log_system(f"Added text to sensory packet: '{text_input['text']}'")
-            
-            # Add keyboard input if available
-            if keyboard_utterance is not None:
-                self.current_sensory_packet['keyboard'] = keyboard_utterance
-                if self.gui:
-                    self.gui.log_system(f"Added keyboard utterance to sensory packet: {len(keyboard_utterance['events'])} events")
+            # Accumulation already handled when inputs were collected above
             
             # Generate LSH hash for the current sensory packet
             if self.current_sensory_packet:
@@ -430,6 +451,12 @@ class Engine:
 
             # 1. Create the sensory vector for the current state
             current_sensory_vector = self._create_sensory_vector(self.current_sensory_packet)
+            
+            # Store the current sensory vector in the experience buffer
+            self.experience_buffer.append(current_sensory_vector)
+            # Keep the buffer from growing indefinitely
+            if len(self.experience_buffer) > self.experience_buffer_max_size:
+                self.experience_buffer.pop(0)
 
             # 2. If a prediction from the last tick exists, calculate the error
             if self.prediction_from_previous_tick is not None:
@@ -541,58 +568,52 @@ class Engine:
                 if self.gui and t_loss is not None:
                     self.gui.log_system(f"D-LSTM Training... Thought Loss: {t_loss:.6f}, Speech Loss: {s_loss:.6f}")
 
-                # 5. Token handling and routing
+                # 5. De-tokenize, sanitize, and route the outputs
                 thought_tokens = np.round(thought_vector).astype(int)
-                thought_text = self.tokenizer.detokenize(thought_tokens)
-
                 output_tokens = np.round(text_vector).astype(int)
 
-                # Filter out <unk> tokens (0) for speech
-                filtered_output_tokens = [int(tok) for tok in output_tokens if int(tok) != 0]
+                # --- NEW: Sanitize outputs by removing the <unk> token (ID 0)
+                # and any token IDs that are not in the tokenizer's vocabulary ---
+                valid_token_ids = set(self.tokenizer.token_to_word.keys()) if hasattr(self.tokenizer, 'token_to_word') else set()
+                sanitized_thought_tokens = [int(token) for token in thought_tokens 
+                                            if int(token) != 0 and int(token) in valid_token_ids]
+                sanitized_output_tokens = [int(token) for token in output_tokens 
+                                           if int(token) != 0 and int(token) in valid_token_ids]
 
-                # Store original unfiltered speech tokens for next tick sensory vector
+                # Store the original unfiltered speech tokens for the next tick's sensory vector
                 self.last_olm_speech_tokens = output_tokens.tolist()
 
-                if not filtered_output_tokens:
-                    output_text = ""
-                    if self.gui:
-                        self.gui.log_speech("(Silence)")
-                        self.gui.log_olm_dialog("(Silence)")
-                else:
-                    output_text = self.tokenizer.detokenize(filtered_output_tokens)
-                    if self.gui:
-                        self.gui.log_speech(output_text)
-                        self.gui.log_olm_dialog(output_text)
+                # De-tokenize the sanitized lists
+                thought_text = self.tokenizer.detokenize(sanitized_thought_tokens) if sanitized_thought_tokens else "(Silent Thought)"
+                output_text = self.tokenizer.detokenize(sanitized_output_tokens) if sanitized_output_tokens else ""
 
-                # Log thoughts
+                # 6. Log and route the sanitized outputs
                 if self.gui:
                     self.gui.log_thoughts(thought_text)
+                    speech_log_msg = output_text if output_text else "(Silence)"
+                    self.gui.log_speech(speech_log_msg)
+                    # Mirror OLM speech into the dedicated dialog panel
+                    if hasattr(self.gui, 'log_olm_dialog'):
+                        self.gui.log_olm_dialog(speech_log_msg)
 
-                # Feed back valid speech and send to TinyLlama
+                # Feed the OLM's external output (if any) back into the system and to TinyLlama
                 if output_text:
                     self.text_handler.add_message(output_text, source='olm')
-                    try:
-                        self.tinyllama_manager.submit_prompt(output_text)
-                    except Exception as e:
-                        if self.gui:
-                            self.gui.log_system(f"TinyLlama submit failed: {e}")
+                    self.tinyllama_manager.submit_prompt(output_text)
 
-                # Update internal state panel after energy update
-                if self.gui:
-                    self.gui.update_internal_state(self.internal_state, self.is_sleeping)
-
-                # 6. Calculate and apply energy consumption for this tick
+                # 7. Calculate and apply energy consumption for this tick
                 thought_cost = 0.002
-                speech_cost = 0.2 * (optimal_depth if optimal_depth is not None else self.text_d_lstm.get_max_depth())
+                # Use the length of the sanitized output for a more accurate speech cost
+                speech_cost = 0.2 * (len(sanitized_output_tokens)) 
                 decay_cost = 0.15
                 total_cost = thought_cost + speech_cost + decay_cost
                 self.internal_state['Energy'] -= total_cost
 
-                # 7. Check for state transition to sleep
+                # 8. Check for state transition to sleep
                 if self.internal_state['Energy'] <= 0:
                     self.internal_state['Energy'] = 0
                     self.is_sleeping = True
-                    self.sleep_ticks_remaining = 30  # Sleep for 30 ticks
+                    self.sleep_ticks_remaining =100  # Sleep for 30 ticks
                     if self.gui:
                         self.gui.log_system("Energy depleted. Entering sleep state.")
             
@@ -662,7 +683,19 @@ class Engine:
             
             # Sleep if there's time remaining in the tick
             if sleep_time > 0:
-                time.sleep(sleep_time)
+                # Use shorter sleep intervals to keep GUI responsive
+                remaining_sleep = sleep_time
+                while remaining_sleep > 0 and self.running:
+                    sleep_chunk = min(0.05, remaining_sleep)  # Max 50ms chunks
+                    time.sleep(sleep_chunk)
+                    remaining_sleep -= sleep_chunk
+                    
+                    # Force GUI update during sleep to prevent freezing
+                    if self.gui:
+                        try:
+                            self.gui.root.update_idletasks()
+                        except:
+                            pass
             else:
                 # Log if we're falling behind
                 warning_message = f"Warning: Tick #{tick_count} took {elapsed_time:.3f}s (target: {1.0/self.tick_rate:.3f}s)"
