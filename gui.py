@@ -27,6 +27,7 @@ class App:
         # Configure grid weights for responsive layout
         self.root.grid_rowconfigure(0, weight=1)
         self.root.grid_rowconfigure(1, weight=0)
+        self.root.grid_rowconfigure(2, weight=0)
         self.root.grid_columnconfigure(0, weight=1)
         self.root.grid_columnconfigure(1, weight=0)
         
@@ -35,6 +36,7 @@ class App:
         
         self.setup_top_section()
         self.setup_right_sidebar()
+        self.setup_olm_dialog_section()
         self.setup_bottom_section()
         
         # Set up console output redirection
@@ -44,7 +46,7 @@ class App:
         """Create the top section with vision displays"""
         # Main container for top section
         top_frame = tk.Frame(self.root, bg='#2b2b2b')
-        top_frame.grid(row=0, column=0, sticky='nsew', padx=10, pady=10)
+        top_frame.grid(row=0, column=0, sticky='nsew', padx=10, pady=(10, 5))
         
         # Configure grid weights for top frame
         top_frame.grid_columnconfigure(0, weight=1)
@@ -88,7 +90,7 @@ class App:
         """Create the right sidebar for internal state"""
         # Right sidebar container
         sidebar_frame = tk.Frame(self.root, bg='#2b2b2b', width=300)
-        sidebar_frame.grid(row=0, column=1, sticky='nsew', padx=(0, 10), pady=10)
+        sidebar_frame.grid(row=0, column=1, rowspan=2, sticky='nsew', padx=(0, 10), pady=10)
         sidebar_frame.grid_propagate(False)  # Maintain fixed width
         
         # Title
@@ -217,12 +219,49 @@ class App:
                                     relief='flat', bd=0,
                                     width=10, height=2)
         self.wipe_button.pack(side='right', padx=(5, 0))
+
+    def setup_olm_dialog_section(self):
+        """Create a large dialog container showing only OLM speech/messages."""
+        dialog_frame = tk.Frame(self.root, bg='#2b2b2b')
+        dialog_frame.grid(row=1, column=0, sticky='nsew', padx=10, pady=(5, 5))
+
+        # Title
+        title = tk.Label(dialog_frame, text="OLM Dialog", bg='#2b2b2b', fg='white', font=('Arial', 12, 'bold'))
+        title.pack(anchor='w', pady=(0, 5))
+
+        # Large text area
+        self.olm_dialog_text = tk.Text(
+            dialog_frame,
+            bg='#1e1e1e', fg='white',
+            font=('Consolas', 11),
+            height=8,
+            state='disabled',
+            relief='solid', bd=1
+        )
+        self.olm_dialog_text.pack(fill='both', expand=True)
+
+        # Scrollbar
+        scrollbar = tk.Scrollbar(dialog_frame, orient='vertical', command=self.olm_dialog_text.yview)
+        scrollbar.pack(side='right', fill='y')
+        self.olm_dialog_text.configure(yscrollcommand=scrollbar.set)
+
+    def log_olm_dialog(self, message: str):
+        """Append a line to the OLM dialog container."""
+        try:
+            self.olm_dialog_text.config(state='normal')
+            import datetime
+            timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+            self.olm_dialog_text.insert(tk.END, f"[{timestamp}] {message}\n")
+            self.olm_dialog_text.see(tk.END)
+            self.olm_dialog_text.config(state='disabled')
+        except Exception:
+            pass
         
     def setup_bottom_section(self):
         """Create the bottom section with five log panels"""
         # Bottom container
         bottom_frame = tk.Frame(self.root, bg='#2b2b2b')
-        bottom_frame.grid(row=1, column=0, columnspan=2, sticky='ew', padx=10, pady=(0, 10))
+        bottom_frame.grid(row=2, column=0, columnspan=2, sticky='ew', padx=10, pady=(5, 10))
         
         # Configure grid weights for five columns
         bottom_frame.grid_columnconfigure(0, weight=1)
@@ -500,6 +539,29 @@ class App:
                 color = '#FF0000'  # Red
         
         self.error_label.config(text=error_text, fg=color)
+    
+    def update_internal_state(self, internal_state, is_sleeping: bool):
+        """Update the Internal State panel (energy, comfort, drivers, and state)."""
+        try:
+            state_line = f"State: {'Sleeping' if is_sleeping else 'Awake'}"
+            energy = internal_state.get('Energy', 0.0)
+            comfort = internal_state.get('Comfort', 0.0)
+            novelty = internal_state.get('Novelty', 0.0)
+            boredom = internal_state.get('Boredom', 0.0)
+            # Confidence is currently static in UI
+            status_text = (
+                f"{state_line}\n"
+                f"---Constraints---\n"
+                f"Energy: {energy:.1f}\n"
+                f"Comfort: {comfort:.1f}\n"
+                f"Confidence: 50.0\n"
+                f"---Drivers---\n"
+                f"Novelty: {novelty:.6f}\n"
+                f"Boredom: {boredom:.1f}"
+            )
+            self.status_label.config(text=status_text)
+        except Exception as e:
+            self.log_system(f"Error updating internal state panel: {e}")
     
     def reset_tps_counter(self):
         """Reset the TPS counter"""

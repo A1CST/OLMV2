@@ -25,7 +25,7 @@ class BaseD_LSTM(nn.Module):
         self.optimizer = torch.optim.Adam(self.parameters(), lr=0.001)
         self.criterion = nn.MSELoss()
 
-    def forward(self, neuro_vector, depth=None):
+    def forward(self, neuro_vector, depth=None, temperature=1.0):
         # If depth is not specified or is too large, use all layers
         if depth is None or depth > len(self.layers):
             depth = len(self.layers)
@@ -35,7 +35,9 @@ class BaseD_LSTM(nn.Module):
         # Process the input through the layers up to the specified depth
         for i in range(depth):
             x = self.layers[i](x)
-
+        # Apply temperature scaling if requested
+        if temperature != 1.0 and temperature > 0:
+            x = x / temperature
         return x
         
     def train_step(self, input_vector, target_vector, depth):
@@ -87,9 +89,9 @@ class ThoughtD_LSTM:
         self.model = BaseD_LSTM(output_size=MAX_OUTPUT_TOKENS)
         self.model.eval()
 
-    def process(self, neuro_vector, internal_state, depth=None):
+    def process(self, neuro_vector, internal_state, depth=None, temperature=1.0):
         with torch.no_grad():
-            output_tensor = self.model(neuro_vector, depth=depth)
+            output_tensor = self.model(neuro_vector, depth=depth, temperature=temperature)
         # Return the vector as a numpy array
         return output_tensor.squeeze(0).cpu().numpy()
 
@@ -106,9 +108,9 @@ class TextD_LSTM:
         self.model = BaseD_LSTM(output_size=MAX_OUTPUT_TOKENS)
         self.model.eval()
 
-    def process(self, neuro_vector, internal_state, depth=None):
+    def process(self, neuro_vector, internal_state, depth=None, temperature=1.0):
         with torch.no_grad():
-            output_tensor = self.model(neuro_vector, depth=depth)
+            output_tensor = self.model(neuro_vector, depth=depth, temperature=temperature)
         # Return the vector as a numpy array
         return output_tensor.squeeze(0).cpu().numpy()
 

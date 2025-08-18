@@ -4,7 +4,7 @@ import torch.nn as nn
 from collections import deque
 
 # Note: The following are placeholders for a future config file
-SENSORY_VECTOR_SIZE = 163
+SENSORY_VECTOR_SIZE = 195
 PATTERN_LSTM_HIDDEN_SIZE = 256
 PATTERN_LSTM_OUTPUT_SIZE = 128
 LSTM1_TEMPORAL_WINDOW_SIZE = 10

@@ -8,7 +8,8 @@ from text_input import TextInputHandler
 from keyboard_input import KeyboardListener
 from tokenizer import CustomTokenizer
 from lsh_system import LSHSystem
-from prediction_model import StatePredictor, MAX_TEXT_TOKENS
+from prediction_model import StatePredictor, MAX_TEXT_TOKENS, PREVIOUS_SPEECH_SIZE
+from tinyllama_integration import TinyLlamaManager
 from P_C_pipe import PatternRecognizer, NeurotransmitterActivator
 from D_pipe import ThoughtD_LSTM, TextD_LSTM
 from hash_info_db import HashInfoDB
@@ -100,53 +101,71 @@ class Engine:
             'Comfort': 75.0
         }
         
+        # Sleep state management
+        self.is_sleeping = False
+        self.sleep_ticks_remaining = 0
+        
+        # Track OLM's last spoken tokens for sensory awareness
+        self.last_olm_speech_tokens = []
+        
+        # Initialize the TinyLlama integration
+        self.tinyllama_manager = TinyLlamaManager(self.text_handler)
+        
         # Track the state before an action is taken
         self.state_before_action = None
         
     def _create_sensory_vector(self, sensory_packet):
-        """Convert sensory packet dictionary into a fixed-length sensory vector"""
+        """Convert sensory packet dictionary into a fixed-length, NORMALIZED sensory vector"""
         # Initialize zero vectors for each sensory modality
         vision_vector = np.zeros(128)
         text_vector = np.zeros(MAX_TEXT_TOKENS)
         keyboard_vector = np.zeros(3)
-        
-        # Process vision data
+        previous_speech_vector = np.zeros(PREVIOUS_SPEECH_SIZE)  # From prediction_model.py
+
+        # --- Process and Normalize Vision Data ---
         if 'vision' in sensory_packet and 'latent_vector' in sensory_packet['vision']:
-            vision_vector = sensory_packet['vision']['latent_vector']
-        
-        # Process text data
+            raw_vision = sensory_packet['vision']['latent_vector']
+            # Normalize vision vector (L2 norm) to a unit vector
+            norm = np.linalg.norm(raw_vision)
+            if norm > 0:
+                vision_vector = raw_vision / norm
+
+        # --- Process and Normalize Text Data ---
         if 'text' in sensory_packet:
             tokens = sensory_packet['text']['text']
             if isinstance(tokens, list):
-                # Truncate or pad the token list to MAX_TEXT_TOKENS
-                if len(tokens) > MAX_TEXT_TOKENS:
-                    text_vector = np.array(tokens[:MAX_TEXT_TOKENS])
-                else:
-                    text_vector[:len(tokens)] = tokens
-        
-        # Process keyboard data
+                padded_tokens = np.zeros(MAX_TEXT_TOKENS)
+                limit = min(len(tokens), MAX_TEXT_TOKENS)
+                padded_tokens[:limit] = tokens[:limit]
+                # Normalize token IDs by dividing by vocabulary size (scales to 0-1 range)
+                vocab_size = self.tokenizer.get_vocabulary_size()
+                if vocab_size > 1:
+                    text_vector = padded_tokens / vocab_size
+
+        # --- Process and Normalize Keyboard Data ---
         if 'keyboard' in sensory_packet:
             keyboard_data = sensory_packet['keyboard']
             events = keyboard_data.get('events', [])
-            
-            # Calculate summary statistics
             num_events = len(events)
-            total_hold_duration = 0.0
-            
-            # Correctly iterate through the list of event dictionaries
-            for event in events:
-                if isinstance(event, dict) and event.get('type') == 'hold':
-                    total_hold_duration += event.get('hold_duration', 0.0)
-            
-            # Use the accurate total_duration from the keyboard_utterance packet
+            total_hold_duration = sum(e.get('hold_duration', 0.0) for e in events if e.get('type') == 'hold')
             total_utterance_duration = keyboard_data.get('total_duration', 0.0)
             
-            keyboard_vector[0] = num_events
-            keyboard_vector[1] = total_hold_duration
-            keyboard_vector[2] = total_utterance_duration
-        
-        # Concatenate all vectors into the final sensory vector
-        sensory_vector = np.concatenate([vision_vector, text_vector, keyboard_vector])
+            # Normalize keyboard data by dividing by plausible maximums
+            keyboard_vector[0] = min(num_events / 50.0, 1.0)                  # Cap at 50 events
+            keyboard_vector[1] = min(total_hold_duration / 5.0, 1.0)          # Cap at 5s hold
+            keyboard_vector[2] = min(total_utterance_duration / 10.0, 1.0)    # Cap at 10s utterance
+
+        # --- Process and Normalize Previous Speech Data ---
+        if self.last_olm_speech_tokens:
+            padded_speech_tokens = np.zeros(PREVIOUS_SPEECH_SIZE)
+            limit = min(len(self.last_olm_speech_tokens), PREVIOUS_SPEECH_SIZE)
+            padded_speech_tokens[:limit] = self.last_olm_speech_tokens[:limit]
+            vocab_size = self.tokenizer.get_vocabulary_size()
+            if vocab_size > 1:
+                previous_speech_vector = padded_speech_tokens / vocab_size
+
+        # Concatenate all NORMALIZED vectors into the final sensory vector
+        sensory_vector = np.concatenate([vision_vector, text_vector, keyboard_vector, previous_speech_vector])
         
         return sensory_vector
         
@@ -233,6 +252,12 @@ class Engine:
             # Stop the keyboard listener first for clean shutdown
             self.keyboard_listener.stop()
             
+            # Stop the TinyLlama manager
+            try:
+                self.tinyllama_manager.stop()
+            except Exception:
+                pass
+            
             # Save LSH state before stopping
             if self.gui:
                 self.gui.log_system("Saving LSH memory...")
@@ -274,8 +299,38 @@ class Engine:
         tick_count = 0
         
         while self.running:
-            # Get start time for this tick
             start_time = time.time()
+            # --- Sleep/Wake State Management ---
+            if self.is_sleeping:
+                # --- SLEEP CYCLE LOGIC ---
+                if self.gui:
+                    self.gui.log_system(f"Sleeping... {self.sleep_ticks_remaining} ticks remaining.")
+                    self.gui.update_internal_state(self.internal_state, self.is_sleeping)
+
+                # TODO: Implement bulk training via replay and hallucination here
+                # Example: self.predictor.train_on_replayed_experience()
+
+                # Generate internal thoughts at a higher temperature for exploration
+                random_neuro_vector = np.random.randn(64).astype(np.float32)
+                thought_vector = self.thought_d_lstm.process(random_neuro_vector, self.internal_state, temperature=1.5)
+                thought_tokens = np.round(thought_vector).astype(int)
+                thought_text = self.tokenizer.detokenize(thought_tokens)
+                if self.gui:
+                    self.gui.log_thoughts(f"(Dream) {thought_text}")
+
+                self.sleep_ticks_remaining -= 1
+                if self.sleep_ticks_remaining <= 0:
+                    self.is_sleeping = False
+                    self.internal_state['Energy'] = 100.0  # Replenish energy
+                    if self.gui:
+                        self.gui.log_system("Waking up. Energy replenished.")
+                        self.gui.update_internal_state(self.internal_state, self.is_sleeping)
+
+                # Sleep for the standard tick duration and skip the wake cycle work
+                time.sleep(1.0 / self.tick_rate)
+                continue
+
+            # --- WAKE CYCLE LOGIC ---
             
             # Check for new text input
             text_input = self.text_handler.get_latest_input()
@@ -486,18 +541,60 @@ class Engine:
                 if self.gui and t_loss is not None:
                     self.gui.log_system(f"D-LSTM Training... Thought Loss: {t_loss:.6f}, Speech Loss: {s_loss:.6f}")
 
-                # 5. De-tokenize and route the outputs
+                # 5. Token handling and routing
                 thought_tokens = np.round(thought_vector).astype(int)
                 thought_text = self.tokenizer.detokenize(thought_tokens)
 
                 output_tokens = np.round(text_vector).astype(int)
-                output_text = self.tokenizer.detokenize(output_tokens)
 
+                # Filter out <unk> tokens (0) for speech
+                filtered_output_tokens = [int(tok) for tok in output_tokens if int(tok) != 0]
+
+                # Store original unfiltered speech tokens for next tick sensory vector
+                self.last_olm_speech_tokens = output_tokens.tolist()
+
+                if not filtered_output_tokens:
+                    output_text = ""
+                    if self.gui:
+                        self.gui.log_speech("(Silence)")
+                        self.gui.log_olm_dialog("(Silence)")
+                else:
+                    output_text = self.tokenizer.detokenize(filtered_output_tokens)
+                    if self.gui:
+                        self.gui.log_speech(output_text)
+                        self.gui.log_olm_dialog(output_text)
+
+                # Log thoughts
                 if self.gui:
                     self.gui.log_thoughts(thought_text)
-                    self.gui.log_speech(output_text)
 
-                self.text_handler.add_message(output_text, source='olm')
+                # Feed back valid speech and send to TinyLlama
+                if output_text:
+                    self.text_handler.add_message(output_text, source='olm')
+                    try:
+                        self.tinyllama_manager.submit_prompt(output_text)
+                    except Exception as e:
+                        if self.gui:
+                            self.gui.log_system(f"TinyLlama submit failed: {e}")
+
+                # Update internal state panel after energy update
+                if self.gui:
+                    self.gui.update_internal_state(self.internal_state, self.is_sleeping)
+
+                # 6. Calculate and apply energy consumption for this tick
+                thought_cost = 0.002
+                speech_cost = 0.2 * (optimal_depth if optimal_depth is not None else self.text_d_lstm.get_max_depth())
+                decay_cost = 0.15
+                total_cost = thought_cost + speech_cost + decay_cost
+                self.internal_state['Energy'] -= total_cost
+
+                # 7. Check for state transition to sleep
+                if self.internal_state['Energy'] <= 0:
+                    self.internal_state['Energy'] = 0
+                    self.is_sleeping = True
+                    self.sleep_ticks_remaining = 30  # Sleep for 30 ticks
+                    if self.gui:
+                        self.gui.log_system("Energy depleted. Entering sleep state.")
             
             # Periodically save tokenizer state to persist vocabulary growth
             if tick_count % CHECKPOINT_SAVE_INTERVAL == 0:
@@ -550,6 +647,8 @@ class Engine:
             # Update TPS counter in GUI
             if self.gui:
                 self.gui.update_tps(tick_count)
+                # Also keep internal panel refreshed during wake cycle
+                self.gui.update_internal_state(self.internal_state, self.is_sleeping)
             
             # Also log to console log if GUI is available
             if self.gui:

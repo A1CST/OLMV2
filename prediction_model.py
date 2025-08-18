@@ -4,7 +4,8 @@ import torch.nn as nn
 from collections import deque
 
 # Sensory vector configuration
-SENSORY_VECTOR_SIZE = 163  # Composition: Vision (128) + Text (32) + Keyboard (3)
+PREVIOUS_SPEECH_SIZE = 32
+SENSORY_VECTOR_SIZE = 195  # Composition: Vision (128) + Text (32) + Keyboard (3) + Prev. Speech (32)
 MAX_TEXT_TOKENS = 32
 PREDICTION_HIDDEN_SIZE = 256
 TEMPORAL_WINDOW_SIZE = 10
