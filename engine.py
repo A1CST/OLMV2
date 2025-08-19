@@ -1,0 +1,1516 @@
+import threading
+import time
+import os
+import random
+import numpy as np
+from collections import deque
+from screen_capture import ScreenCapturer
+from beta_vae import BetaVAE
+from text_input import TextInputHandler
+from keyboard_input import KeyboardListener
+from tokenizer import CustomTokenizer
+from lsh_system import LSHSystem
+from prediction_model import StatePredictor, MAX_TEXT_TOKENS, PREVIOUS_SPEECH_SIZE, SENSORY_VECTOR_SIZE
+from neuro_predictor import NeuroPredictor, NEUROTRANSMITTER_VECTOR_SIZE
+from tinyllama_integration import TinyLlamaManager
+from P_C_pipe import PatternRecognizer, NeurotransmitterActivator
+from D_pipe import ThoughtD_LSTM, TextD_LSTM
+from hash_info_db import HashInfoDB
+
+# Configuration constants
+VISION_CAPTURE_INTERVAL = 10  # Capture screen every N ticks
+CHECKPOINT_SAVE_INTERVAL = 200  # Save checkpoints every N ticks
+PACKET_SUMMARY_INTERVAL = 20  # Log sensory packet summary every N ticks
+STABILIZATION_THRESHOLD = 0.1  # Threshold for calibration stabilization (10%)
+
+class Engine:
+    def __init__(self, gui=None):
+        """Initialize the engine with a reference to the GUI"""
+        self.gui = gui
+        self.tick_rate = 20  # 20 ticks per second
+        self.running = False
+        self.thread = None
+        self.checkpoints_dir = "checkpoints"
+        self.dream_logs_dir = "dream_logs"
+        
+        # Create checkpoints directory if it doesn't exist
+        self.ensure_checkpoints_dir()
+        
+        # Create dream logs directory if it doesn't exist
+        if not os.path.exists(self.dream_logs_dir):
+            os.makedirs(self.dream_logs_dir, exist_ok=True)
+        
+        # Initialize screen capturer
+        self.capturer = ScreenCapturer()
+        
+        # Initialize Beta-VAE model
+        self.vae = BetaVAE()
+        
+        # Initialize text input handler
+        self.text_handler = TextInputHandler()
+        
+        # Initialize keyboard listener
+        self.keyboard_listener = KeyboardListener()
+        
+        # Initialize tokenizer with checkpoint file
+        tokenizer_checkpoint_file = os.path.join(self.checkpoints_dir, "tokenizer_vocab.pkl")
+        self.tokenizer = CustomTokenizer(checkpoint_path=tokenizer_checkpoint_file)
+        
+        # Initialize LSH system with checkpoint file
+        lsh_checkpoint_file = os.path.join(self.checkpoints_dir, "lsh_memory.pkl")
+        self.lsh_system = LSHSystem(latent_dim=128, num_hashes=64, checkpoint_path=lsh_checkpoint_file)
+        
+        # Initialize the hash information database
+        hash_db_checkpoint_file = os.path.join(self.checkpoints_dir, "hash_info_db.pkl")
+        self.hash_db = HashInfoDB(checkpoint_path=hash_db_checkpoint_file)
+        
+        # Initialize persistent sensory packet
+        self.current_sensory_packet = {}
+        
+        # Initialize hash tracking
+        self.last_tick_hash = None
+        
+        # Initialize the state prediction model
+        self.predictor = StatePredictor()
+        
+        # Initialize the neuro prediction model
+        self.neuro_predictor = NeuroPredictor()
+        
+        # Load the prediction model if a checkpoint exists
+        predictor_checkpoint_file = os.path.join(self.checkpoints_dir, "prediction_model.pth")
+        if os.path.exists(predictor_checkpoint_file):
+            try:
+                self.predictor.load_model(predictor_checkpoint_file)
+                if self.gui:
+                    self.gui.log_system("Loaded prediction model from checkpoint.")
+                else:
+                    print("Loaded prediction model from checkpoint.")
+            except Exception as e:
+                error_msg = f"Error loading prediction model: {e}"
+                if self.gui:
+                    self.gui.log_system(error_msg)
+                else:
+                    print(error_msg)
+        
+        # Track the previous sensory vector for training purposes
+        self.previous_sensory_vector = None
+        
+        # Store the prediction from the previous tick for error calculation
+        self.prediction_from_previous_tick = None
+        
+        # Store the neuro prediction from the previous tick for dream error calculation
+        self.neuro_prediction_from_previous_tick = None
+        
+        # Initialize the main OLM pipeline models
+        self.pattern_recognizer = PatternRecognizer()
+        self.neuro_activator = NeurotransmitterActivator()
+        self.thought_d_lstm = ThoughtD_LSTM()
+        self.text_d_lstm = TextD_LSTM()
+        
+        # Initialize internal state
+        self.internal_state = {
+            'Novelty': 0.0,
+            'Energy': 100.0,
+            'Boredom': 0.0,
+            'Comfort': 75.0
+        }
+        
+        # Sleep state management
+        self.is_sleeping = False
+        self.sleep_ticks_remaining = 0
+        
+        # Reading state management
+        self.is_reading = False
+        self.books_directory = "books"
+        self.current_book_path = None
+        self.current_book_file = None
+        self.books_read_this_cycle = 0  # Track books read per awake cycle
+        
+        # Experience replay buffer for sleep cycle
+        self.experience_buffer = []
+        self.experience_buffer_max_size = 1000 # Store the last ~50 seconds of experience
+        
+        # Track OLM's last spoken tokens for sensory awareness
+        self.last_olm_speech_tokens = []
+        
+        # Initialize the TinyLlama integration
+        self.tinyllama_manager = TinyLlamaManager(self.text_handler)
+        
+        # Track the state before an action is taken
+        self.state_before_action = None
+        
+        # Thought history tracking for boredom analysis
+        self.thought_history = deque(maxlen=20)  # Store the last 20 thought vectors
+        self.consecutive_similar_thoughts = 0  # Count consecutive similar thoughts
+        
+        # Dream state tracking for continuous dream evolution
+        self.current_dream_neuro_vector = None
+        
+        # Dream thought tracking for stream of consciousness
+        self.last_dream_thought_tokens = []
+        
+        # Dream logging system
+        self.dream_log_enabled = False
+        self.current_dream_log_file = None
+        
+    def _create_sensory_vector(self, sensory_packet):
+        """Convert sensory packet dictionary into a fixed-length, NORMALIZED sensory vector"""
+        # Initialize zero vectors for each sensory modality
+        vision_vector = np.zeros(128)
+        text_vector = np.zeros(MAX_TEXT_TOKENS)
+        keyboard_vector = np.zeros(3)
+        previous_speech_vector = np.zeros(PREVIOUS_SPEECH_SIZE)  # From prediction_model.py
+
+        # --- Process and Normalize Vision Data ---
+        if 'vision' in sensory_packet and 'latent_vector' in sensory_packet['vision']:
+            raw_vision = sensory_packet['vision']['latent_vector']
+            # Normalize vision vector (L2 norm) to a unit vector
+            norm = np.linalg.norm(raw_vision)
+            if norm > 0:
+                vision_vector = raw_vision / norm
+
+        # --- Process and Normalize Text Data ---
+        if 'text' in sensory_packet:
+            tokens = sensory_packet['text']['text']
+            if isinstance(tokens, list):
+                padded_tokens = np.zeros(MAX_TEXT_TOKENS)
+                limit = min(len(tokens), MAX_TEXT_TOKENS)
+                padded_tokens[:limit] = tokens[:limit]
+                # Normalize token IDs by dividing by vocabulary size (scales to 0-1 range)
+                vocab_size = self.tokenizer.get_vocabulary_size()
+                if vocab_size > 1:
+                    text_vector = padded_tokens / vocab_size
+
+        # --- Process and Normalize Keyboard Data ---
+        if 'keyboard' in sensory_packet:
+            keyboard_data = sensory_packet['keyboard']
+            events = keyboard_data.get('events', [])
+            num_events = len(events)
+            total_hold_duration = sum(e.get('hold_duration', 0.0) for e in events if e.get('type') == 'hold')
+            total_utterance_duration = keyboard_data.get('total_duration', 0.0)
+            
+            # Normalize keyboard data by dividing by plausible maximums
+            keyboard_vector[0] = min(num_events / 50.0, 1.0)                  # Cap at 50 events
+            keyboard_vector[1] = min(total_hold_duration / 5.0, 1.0)          # Cap at 5s hold
+            keyboard_vector[2] = min(total_utterance_duration / 10.0, 1.0)    # Cap at 10s utterance
+
+        # --- Process and Normalize Previous Speech Data ---
+        if self.is_sleeping and self.last_dream_thought_tokens:
+            # During sleep, use dream thoughts as previous speech input
+            padded_speech_tokens = np.zeros(PREVIOUS_SPEECH_SIZE)
+            limit = min(len(self.last_dream_thought_tokens), PREVIOUS_SPEECH_SIZE)
+            padded_speech_tokens[:limit] = self.last_dream_thought_tokens[:limit]
+            vocab_size = self.tokenizer.get_vocabulary_size()
+            if vocab_size > 1:
+                previous_speech_vector = padded_speech_tokens / vocab_size
+        elif self.last_olm_speech_tokens:
+            # During wake cycle, use OLM's actual speech
+            padded_speech_tokens = np.zeros(PREVIOUS_SPEECH_SIZE)
+            limit = min(len(self.last_olm_speech_tokens), PREVIOUS_SPEECH_SIZE)
+            padded_speech_tokens[:limit] = self.last_olm_speech_tokens[:limit]
+            vocab_size = self.tokenizer.get_vocabulary_size()
+            if vocab_size > 1:
+                previous_speech_vector = padded_speech_tokens / vocab_size
+
+        # Concatenate all NORMALIZED vectors into the final sensory vector
+        sensory_vector = np.concatenate([vision_vector, text_vector, keyboard_vector, previous_speech_vector])
+        
+        return sensory_vector
+        
+    def _get_sentiment_score(self, text: str):
+        """
+        Simple keyword-based sentiment analysis function.
+        Returns a sentiment score based on positive/negative keywords.
+        """
+        # Define positive and negative keywords
+        positive_keywords = ['good', 'great', 'awesome', 'like', 'love', 'yes', 'correct', 'wonderful', 'nice', 'excellent', 'amazing', 'fantastic', 'perfect', 'beautiful', 'happy', 'joy', 'pleasure', 'delight', 'satisfied', 'content']
+        negative_keywords = ['bad', 'no', 'stop', 'hate', 'wrong', 'terrible', 'horrible', 'awful', 'dislike', 'disgusting', 'ugly', 'sad', 'angry', 'frustrated', 'annoyed', 'disappointed', 'upset', 'worried', 'scared', 'afraid']
+        
+        # Initialize score
+        score = 0
+        
+        # Convert text to lowercase and split into words
+        words = text.lower().split()
+        
+        # Count positive and negative words
+        for word in words:
+            if word in positive_keywords:
+                score += 1
+            elif word in negative_keywords:
+                score -= 1
+        
+        return score
+        
+    def _calculate_thought_similarity(self, vec1, vec2):
+        """
+        Calculate cosine similarity between two thought vectors.
+        
+        Args:
+            vec1 (numpy.ndarray): First thought vector
+            vec2 (numpy.ndarray): Second thought vector
+            
+        Returns:
+            float: Cosine similarity score between 0 and 1
+        """
+        # Ensure vectors are numpy arrays
+        vec1 = np.array(vec1)
+        vec2 = np.array(vec2)
+        
+        # Check if vectors have the same shape
+        if vec1.shape != vec2.shape:
+            # If shapes don't match, pad the shorter vector or truncate the longer one
+            min_length = min(len(vec1), len(vec2))
+            vec1 = vec1[:min_length]
+            vec2 = vec2[:min_length]
+            
+            if self.gui:
+                self.gui.log_system(f"Warning: Thought vectors had different shapes, truncated to {min_length} dimensions")
+        
+        # Calculate norms
+        norm_vec1 = np.linalg.norm(vec1)
+        norm_vec2 = np.linalg.norm(vec2)
+        
+        # Check for zero norms to prevent division by zero
+        if norm_vec1 == 0 or norm_vec2 == 0:
+            return 0.0
+        
+        # Calculate cosine similarity: dot_product / (norm_vec1 * norm_vec2)
+        dot_product = np.dot(vec1, vec2)
+        similarity = dot_product / (norm_vec1 * norm_vec2)
+        
+        return similarity
+        
+    def _update_boredom_from_thought_repetition(self):
+        """
+        Analyze thought history and update boredom based on repetitive thoughts.
+        """
+        # Check if we have enough thoughts to compare
+        if len(self.thought_history) < 2:
+            return
+        
+        # Get the most recent and previous thought vectors
+        current_thought = self.thought_history[-1]
+        previous_thought = self.thought_history[-2]
+        
+        # Calculate similarity between current and previous thoughts
+        similarity = self._calculate_thought_similarity(current_thought, previous_thought)
+        
+        # Check if thoughts are very similar
+        if similarity > 0.98:
+            self.consecutive_similar_thoughts += 1
+        else:
+            self.consecutive_similar_thoughts = 0
+        
+        # Apply boredom increase if we have many consecutive similar thoughts
+        if self.consecutive_similar_thoughts > 5:
+            boredom_increase = 0.2 * self.consecutive_similar_thoughts  # Reduced from 0.5 to 0.2
+            self.internal_state['Boredom'] += boredom_increase
+            
+            # Clamp boredom to prevent exceeding 100
+            self.internal_state['Boredom'] = max(0, min(100, self.internal_state['Boredom']))
+            
+            if self.gui:
+                self.gui.log_system(f"Thought repetition detected! Similarity: {similarity:.3f}, Consecutive: {self.consecutive_similar_thoughts}, Boredom +{boredom_increase:.1f} (now {self.internal_state['Boredom']:.1f})")
+        
+    def _calibrate_new_hash(self, neuro_vector):
+        """
+        Performs a one-time calibration for a new hash to find optimal depths.
+        
+        Args:
+            neuro_vector (numpy.ndarray): Neurotransmitter vector to calibrate with
+            
+        Returns:
+            dict: Calibrated depths dictionary with 'optimal', 'streamlined', 'deep' keys
+        """
+        # Validate input
+        if neuro_vector is None or len(neuro_vector) == 0:
+            if self.gui:
+                self.gui.log_system("Error: Invalid neuro_vector for calibration")
+            return {'optimal': 4, 'streamlined': 2, 'deep': 8}  # Safe defaults
+        if self.gui:
+            self.gui.log_system("--- Starting D-LSTM Calibration ---")
+
+        output_vectors = []
+        max_depth = self.text_d_lstm.get_max_depth()
+
+        for depth in range(1, max_depth + 1):
+            # We only need to calibrate one of the D-LSTMs as they share an architecture
+            vector = self.text_d_lstm.process(neuro_vector, self.internal_state, depth=depth)
+            output_vectors.append(vector)
+            if self.gui:
+                self.gui.log_system(f"  Depth {depth}/{max_depth}: Output Mean = {vector.mean():.6f}")
+
+        # Find where the output stabilizes
+        # Since layers have different output sizes, we'll use a simpler heuristic
+        # Look for the point where the output magnitude stabilizes
+        optimal_depth = max_depth
+        if len(output_vectors) > 1:
+            # Calculate the magnitude of each output vector
+            magnitudes = [np.linalg.norm(vec) for vec in output_vectors]
+            
+            # Find where the magnitude change becomes small
+            stabilization_threshold = STABILIZATION_THRESHOLD
+            for i in range(1, len(magnitudes)):
+                if magnitudes[i] > 0 and magnitudes[i-1] > 0:  # Prevent division by zero
+                    change_ratio = abs(magnitudes[i] - magnitudes[i-1]) / magnitudes[i-1]
+                    if change_ratio < stabilization_threshold:
+                        optimal_depth = i + 1  # Use the depth that produced the stable magnitude
+                        break
+
+        # For now, streamlined and deep are placeholders based on optimal
+        streamlined_depth = max(1, optimal_depth // 2)
+
+        calibrated_depths = {
+            'optimal': optimal_depth,
+            'streamlined': streamlined_depth,
+            'deep': max_depth
+        }
+
+        if self.gui:
+            self.gui.log_system(f"--- Calibration Complete ---")
+            self.gui.log_system(f"  > Optimal Depth Found: {optimal_depth}")
+
+        return calibrated_depths
+        
+    def _start_reading_session(self):
+        """Start a reading session by selecting and opening a random book."""
+        # Check if books directory exists
+        if not os.path.exists(self.books_directory):
+            if self.gui:
+                self.gui.log_system(f"Error: Books directory '{self.books_directory}' does not exist")
+            else:
+                print(f"Error: Books directory '{self.books_directory}' does not exist")
+            return
+        
+        # Get list of all files in the directory
+        try:
+            book_files = [f for f in os.listdir(self.books_directory) if os.path.isfile(os.path.join(self.books_directory, f))]
+        except Exception as e:
+            if self.gui:
+                self.gui.log_system(f"Error reading books directory: {e}")
+            else:
+                print(f"Error reading books directory: {e}")
+            return
+        
+        if not book_files:
+            if self.gui:
+                self.gui.log_system("Warning: No books found in books directory")
+            else:
+                print("Warning: No books found in books directory")
+            return
+        
+        # Randomly select a book
+        selected_book = random.choice(book_files)
+        self.current_book_path = os.path.join(self.books_directory, selected_book)
+        
+        # Open the book file
+        try:
+            self.current_book_file = open(self.current_book_path, 'r', encoding='utf-8')
+            self.is_reading = True
+            
+            if self.gui:
+                self.gui.log_system(f"Started reading session: {selected_book}")
+            else:
+                print(f"Started reading session: {selected_book}")
+                
+        except Exception as e:
+            if self.gui:
+                self.gui.log_system(f"Error opening book '{selected_book}': {e}")
+            else:
+                print(f"Error opening book '{selected_book}': {e}")
+            self.current_book_path = None
+            self.current_book_file = None
+    
+    def _stop_reading_session(self):
+        """Stop the current reading session and reset state."""
+        if self.gui:
+            self.gui.log_system("Reading session ended")
+        else:
+            print("Reading session ended")
+        
+        # Close the book file if it's open
+        if self.current_book_file is not None:
+            try:
+                self.current_book_file.close()
+            except Exception as e:
+                if self.gui:
+                    self.gui.log_system(f"Error closing book file: {e}")
+                else:
+                    print(f"Error closing book file: {e}")
+        
+        # Reset reading state variables
+        self.is_reading = False
+        self.current_book_path = None
+        self.current_book_file = None
+        
+        # Increment books read counter for this awake cycle
+        self.books_read_this_cycle += 1
+        if self.gui:
+            self.gui.log_system(f"Books read this awake cycle: {self.books_read_this_cycle}/1")
+        
+        # Reset boredom as cooldown mechanism
+        self.internal_state['Boredom'] = 0
+        
+    def start(self):
+        """Start the engine in a separate thread"""
+        if not self.running:
+            self.running = True
+            self.thread = threading.Thread(target=self._run_loop)
+            self.thread.daemon = True
+            self.thread.start()
+            
+            # Start the keyboard listener
+            self.keyboard_listener.start()
+            
+            if self.gui:
+                self.gui.log_system("Engine starting...")
+                self.gui.reset_tps_counter()
+                # Initialize token counter display
+                if hasattr(self.gui, 'update_token_counter'):
+                    self.gui.update_token_counter()
+            else:
+                print("Engine starting...")
+                
+    def stop(self):
+        """Stop the engine"""
+        if self.running:
+            # Stop the keyboard listener first for clean shutdown
+            self.keyboard_listener.stop()
+            
+            # Stop the TinyLlama manager
+            try:
+                self.tinyllama_manager.stop()
+            except Exception:
+                pass
+            
+            # Save LSH state before stopping
+            if self.gui:
+                self.gui.log_system("Saving LSH memory...")
+            else:
+                print("Saving LSH memory...")
+            self.lsh_system.save_state()
+            
+            # Save tokenizer state before stopping
+            if self.gui:
+                self.gui.log_system("Saving tokenizer vocabulary...")
+            else:
+                print("Saving tokenizer vocabulary...")
+            self.tokenizer.save_state()
+            
+            # Save prediction model state before stopping
+            if self.gui:
+                self.gui.log_system("Saving prediction model state...")
+            else:
+                print("Saving prediction model state...")
+            predictor_checkpoint_file = os.path.join(self.checkpoints_dir, "prediction_model.pth")
+            self.predictor.save_model(predictor_checkpoint_file)
+            
+            # Save HashInfoDB state
+            if self.gui:
+                self.gui.log_system("Saving Hash Info DB...")
+            else:
+                print("Saving Hash Info DB...")
+            self.hash_db.save_state()
+            
+            self.running = False
+            
+            if self.gui:
+                self.gui.log_system("Engine stopping...")
+            else:
+                print("Engine stopping...")
+                
+    def _run_loop(self):
+        """Main engine loop running in a separate thread"""
+        tick_count = 0
+        
+        while self.running:
+            start_time = time.time()
+            # --- Sleep/Wake State Management ---
+            if self.is_sleeping:
+                # --- SLEEP CYCLE LOGIC ---
+                
+                # Initialize dream logging if enabled
+                if self.dream_log_enabled and self.current_dream_log_file is None:
+                    import datetime
+                    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                    dream_log_filename = f"dream_log_{timestamp}.txt"
+                    dream_log_path = os.path.join(self.dream_logs_dir, dream_log_filename)
+                    try:
+                        self.current_dream_log_file = open(dream_log_path, 'w', encoding='utf-8')
+                        self.current_dream_log_file.write(f"--- DREAM LOG START ---\n")
+                        self.current_dream_log_file.write(f"Timestamp: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                        self.current_dream_log_file.write(f"Initial Energy: {self.internal_state['Energy']:.1f}\n")
+                        self.current_dream_log_file.write(f"Initial Boredom: {self.internal_state['Boredom']:.1f}\n")
+                        self.current_dream_log_file.write(f"Initial Comfort: {self.internal_state['Comfort']:.1f}\n")
+                        self.current_dream_log_file.write(f"Initial Novelty: {self.internal_state['Novelty']:.6f}\n")
+                        self.current_dream_log_file.write("-" * 50 + "\n\n")
+                        if self.gui:
+                            self.gui.log_system(f"Dream logging started: {dream_log_filename}")
+                    except Exception as e:
+                        if self.gui:
+                            self.gui.log_system(f"Error creating dream log file: {e}")
+                        self.current_dream_log_file = None
+                
+                if self.gui:
+                    self.gui.log_system(f"Sleeping... {self.sleep_ticks_remaining} ticks remaining.")
+                    self.gui.update_internal_state(self.internal_state, self.is_sleeping)
+
+                # TODO: Implement bulk training via replay and hallucination here
+                # Example: self.predictor.train_on_replayed_experience()
+
+                # --- Continuous Dream Evolution Logic ---
+                if self.current_dream_neuro_vector is not None and self.neuro_prediction_from_previous_tick is not None:
+                    # Calculate prediction error between last prediction and the current dream neuro vector
+                    prediction_error = np.mean((self.neuro_prediction_from_previous_tick - self.current_dream_neuro_vector)**2)
+                    # Scale the raw MSE to a more behaviorally useful 0-100 range
+                    NOVELTY_SCALING_FACTOR = 10000
+                    scaled_novelty = prediction_error * NOVELTY_SCALING_FACTOR
+                    
+                    # Update internal state, capping the novelty at 100
+                    self.internal_state['Novelty'] = min(scaled_novelty, 100.0)
+                    if self.gui:
+                        self.gui.log_system(f"Dream Novelty: {prediction_error:.6f}")
+                    
+                    # Log dream evolution details
+                    if self.current_dream_log_file:
+                        self.current_dream_log_file.write(f"[Tick {tick_count}] Dream Evolution:\n")
+                        self.current_dream_log_file.write(f"  Current Dream Neuro Vector Mean: {self.current_dream_neuro_vector.mean():.6f}\n")
+                        self.current_dream_log_file.write(f"  Current Dream Neuro Vector Std: {self.current_dream_neuro_vector.std():.6f}\n")
+                        self.current_dream_log_file.write(f"  Prediction Error (Novelty): {prediction_error:.6f}\n")
+                        self.current_dream_log_file.write(f"  Previous Prediction Mean: {self.neuro_prediction_from_previous_tick.mean():.6f}\n")
+                        self.current_dream_log_file.write(f"  Previous Prediction Std: {self.neuro_prediction_from_previous_tick.std():.6f}\n")
+
+                    # Update Boredom based on dream novelty
+                    if self.internal_state['Novelty'] > 100.0:
+                        self.internal_state['Boredom'] = 0
+                    elif self.internal_state['Novelty'] < 50.0:
+                        self.internal_state['Boredom'] += 0.1
+                    
+                    # Clamp Boredom between 0 and 100
+                    self.internal_state['Boredom'] = max(0, min(100, self.internal_state['Boredom']))
+                    
+                    # Update boredom based on thought repetition
+                    self._update_boredom_from_thought_repetition()
+                    
+                    # Log driver updates
+                    if self.current_dream_log_file:
+                        self.current_dream_log_file.write(f"  Driver Updates:\n")
+                        self.current_dream_log_file.write(f"    Novelty: {self.internal_state['Novelty']:.6f}\n")
+                        self.current_dream_log_file.write(f"    Boredom: {self.internal_state['Boredom']:.1f}\n")
+                        self.current_dream_log_file.write(f"    Consecutive Similar Thoughts: {self.consecutive_similar_thoughts}\n")
+
+                    # Evolve the dream by predicting the next dream frame using neuro predictor
+                    predicted_next_neuro_vector = self.neuro_predictor.predict(self.current_dream_neuro_vector)
+                    
+                    # Update the prediction state for the next tick's comparison (use clean prediction)
+                    self.neuro_prediction_from_previous_tick = predicted_next_neuro_vector
+                    
+                    # Dream noise injection mechanism to prevent repetitive loops
+                    current_boredom = self.internal_state['Boredom']
+                    noise_magnitude = (current_boredom / 100.0) * 0.1
+                    
+                    if noise_magnitude > 0.001:  # Only inject noise if boredom is significant
+                        # Create noise vector scaled by boredom
+                        noise_vector = np.random.normal(0, noise_magnitude, size=NEUROTRANSMITTER_VECTOR_SIZE)
+                        # Add noise to the predicted dream vector
+                        self.current_dream_neuro_vector = predicted_next_neuro_vector + noise_vector
+                        
+                        # Log noise injection
+                        if self.current_dream_log_file:
+                            self.current_dream_log_file.write(f"  [Tick {tick_count}] Injected dream noise with magnitude: {noise_magnitude:.4f}\n")
+                    else:
+                        # No noise injection - use clean prediction
+                        self.current_dream_neuro_vector = predicted_next_neuro_vector
+                    
+                    # Log dream prediction
+                    if self.current_dream_log_file:
+                        self.current_dream_log_file.write(f"  Dream Prediction:\n")
+                        self.current_dream_log_file.write(f"    Predicted Next Vector Mean: {predicted_next_neuro_vector.mean():.6f}\n")
+                        self.current_dream_log_file.write(f"    Predicted Next Vector Std: {predicted_next_neuro_vector.std():.6f}\n")
+
+                # --- Process the Dream for Internal Thought ---
+                # Dream now starts with a neuro_vector, so we bypass the perceptual pipeline
+                if self.current_dream_neuro_vector is not None:
+                    dream_neuro_vector = self.current_dream_neuro_vector
+                else:
+                    # Fallback to random neuro vector if dream vector is not available
+                    dream_neuro_vector = np.random.randn(NEUROTRANSMITTER_VECTOR_SIZE).astype(np.float32)
+
+                # Calculate dynamic temperature based on boredom level (same as wake cycle)
+                current_boredom = self.internal_state['Boredom']
+                dynamic_temperature = 1.0 + (current_boredom / 100.0) * 0.5
+
+                thought_vector = self.thought_d_lstm.process(dream_neuro_vector, self.internal_state, temperature=dynamic_temperature)
+                thought_tokens = np.round(thought_vector).astype(int)
+                
+                # Store dream thought tokens for stream of consciousness
+                self.last_dream_thought_tokens = thought_tokens.tolist()
+                
+                thought_text = self.tokenizer.detokenize(thought_tokens)
+                
+                # Store dream thought vector in history for boredom analysis
+                self.thought_history.append(thought_vector)
+                
+                # Log dream thought generation
+                if self.current_dream_log_file:
+                    self.current_dream_log_file.write(f"  Dream Thought Generation:\n")
+                    self.current_dream_log_file.write(f"    Dream Neuro Vector Mean: {dream_neuro_vector.mean():.6f}\n")
+                    self.current_dream_log_file.write(f"    Dream Neuro Vector Std: {dream_neuro_vector.std():.6f}\n")
+                    self.current_dream_log_file.write(f"    Thought Vector Mean: {thought_vector.mean():.6f}\n")
+                    self.current_dream_log_file.write(f"    Thought Vector Std: {thought_vector.std():.6f}\n")
+                    self.current_dream_log_file.write(f"    Thought Tokens: {thought_tokens.tolist()}\n")
+                    self.current_dream_log_file.write(f"    Thought Text: \"{thought_text}\"\n")
+                    self.current_dream_log_file.write(f"    Temperature: {dynamic_temperature:.3f}\n")
+                    self.current_dream_log_file.write(f"    Sleep Ticks Remaining: {self.sleep_ticks_remaining}\n")
+                    self.current_dream_log_file.write("-" * 30 + "\n\n")
+                
+                if self.gui:
+                    self.gui.log_thoughts(f"(Dream) {thought_text}")
+
+                self.sleep_ticks_remaining -= 1
+                if self.sleep_ticks_remaining <= 0:
+                    # Close dream log file if it exists
+                    if self.current_dream_log_file:
+                        import datetime
+                        self.current_dream_log_file.write(f"\n--- DREAM LOG END ---\n")
+                        self.current_dream_log_file.write(f"Final Timestamp: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                        self.current_dream_log_file.write(f"Final Energy: {self.internal_state['Energy']:.1f}\n")
+                        self.current_dream_log_file.write(f"Final Boredom: {self.internal_state['Boredom']:.1f}\n")
+                        self.current_dream_log_file.write(f"Final Comfort: {self.internal_state['Comfort']:.1f}\n")
+                        self.current_dream_log_file.write(f"Final Novelty: {self.internal_state['Novelty']:.6f}\n")
+                        self.current_dream_log_file.write(f"Total Dream Ticks: {tick_count}\n")
+                        self.current_dream_log_file.close()
+                        self.current_dream_log_file = None
+                        if self.gui:
+                            self.gui.log_system("Dream logging completed and file closed.")
+                    
+                    self.is_sleeping = False
+                    self.internal_state['Energy'] = 100.0  # Replenish energy
+                    
+                    # Reset books read counter for new awake cycle
+                    self.books_read_this_cycle = 0
+                    
+                    # Clear dream thought history to prevent leakage into wake state
+                    self.last_dream_thought_tokens = []
+                    
+                    if self.gui:
+                        self.gui.log_system("Waking up. Energy replenished.")
+                        self.gui.update_internal_state(self.internal_state, self.is_sleeping)
+
+                # Update tick count and TPS even during sleep
+                tick_count += 1
+                if self.gui:
+                    self.gui.update_tps(tick_count)
+                    self.gui.log_console(f"Sleep Tick! #{tick_count}")
+
+                # Sleep for the standard tick duration and skip the wake cycle work
+                # Use a shorter sleep to keep GUI responsive
+                time.sleep(0.05)  # 50ms instead of full tick duration
+                
+                # Force GUI update to prevent freezing
+                if self.gui:
+                    try:
+                        self.gui.root.update_idletasks()
+                    except:
+                        pass
+                continue
+
+            elif self.is_reading:
+                # --- READING CYCLE LOGIC ---
+                
+                # Check if book file is valid
+                if self.current_book_file is None:
+                    self._stop_reading_session()
+                    continue
+                
+                # Read one line from the book
+                try:
+                    line = self.current_book_file.readline()
+                except Exception as e:
+                    if self.gui:
+                        self.gui.log_system(f"Error reading from book: {e}")
+                    self._stop_reading_session()
+                    continue
+                
+                # Check if we've reached the end of the file
+                if not line:
+                    self._stop_reading_session()
+                    continue
+                
+                # Process the line if it has content
+                line_text = line.strip()
+                if line_text:
+                    # Add the line to text handler
+                    self.text_handler.add_message(line_text, source='book')
+                    
+                    # Log to GUI
+                    if self.gui:
+                        self.gui.log_speech(f"(Reading) {line_text}")
+                
+                # Apply energy cost for reading
+                self.internal_state['Energy'] -= 0.05
+                
+                # --- Process the read text through the cognitive pipeline ---
+                # Reset sensory packet for this tick
+                self.current_sensory_packet = {}
+                
+                # Get the text input we just added
+                text_input = self.text_handler.get_latest_input()
+                if text_input is not None and text_input['source'] == 'book':
+                    original_text = text_input['text']
+                    # Tokenize the text
+                    tokenized_text = self.tokenizer.tokenize(original_text)
+                    
+                    # Add to the sensory packet
+                    self.current_sensory_packet['text'] = {
+                        'source': text_input['source'],
+                        'text': tokenized_text
+                    }
+                    if self.gui:
+                        self.gui.log_system(f"Book text tokenized.")
+                
+                # Generate LSH hash for the current sensory packet
+                if self.current_sensory_packet:
+                    current_hash = self.lsh_system.generate_hash(self.current_sensory_packet, self.last_tick_hash)
+                    
+                    if self.gui:
+                        self.gui.log_system(f"Generated LSH hash: {current_hash[:16]}...")
+                    
+                    self.last_tick_hash = current_hash
+                    self.current_sensory_packet['lsh_hash'] = current_hash
+                
+                # Create sensory vector and run prediction
+                current_sensory_vector = self._create_sensory_vector(self.current_sensory_packet)
+                
+                # Note: Experience buffer now stores neuro_vectors instead of sensory_vectors
+                # Neuro vectors are added to the buffer in the OLM pipeline section
+                
+                # Calculate prediction error
+                if self.prediction_from_previous_tick is not None:
+                    prediction_error = np.mean((self.prediction_from_previous_tick - current_sensory_vector)**2)
+                    if self.gui:
+                        self.gui.log_system(f"Prediction Error (Novelty): {prediction_error:.6f}")
+                        self.gui.update_prediction_error(prediction_error)
+                    # Scale the raw MSE to a more behaviorally useful 0-100 range
+                    NOVELTY_SCALING_FACTOR = 10000
+                    scaled_novelty = prediction_error * NOVELTY_SCALING_FACTOR
+                    
+                    # Update internal state, capping the novelty at 100
+                    self.internal_state['Novelty'] = min(scaled_novelty, 100.0)
+                else:
+                    if self.gui:
+                        self.gui.update_prediction_error(None)
+                
+                # --- Boredom Driver Logic for Reading Cycle ---
+                # High novelty events completely eliminate boredom
+                if self.internal_state['Novelty'] > 100.0:
+                    self.internal_state['Boredom'] = 0
+                # Low novelty causes boredom to increase
+                elif self.internal_state['Novelty'] < 50.0:
+                    self.internal_state['Boredom'] += 0.1
+                
+                # Clamp Boredom between 0 and 100
+                self.internal_state['Boredom'] = max(0, min(100, self.internal_state['Boredom']))
+                
+                # --- Comfort Driver Logic for Reading Cycle ---
+                # Reading increases comfort as it's a pleasant, engaging activity
+                self.internal_state['Comfort'] += 0.05  # +0.05 per tick while reading
+                
+                # Clamp Comfort between 0 and 100
+                self.internal_state['Comfort'] = max(0, min(100, self.internal_state['Comfort']))
+                
+                # Update boredom based on thought repetition
+                self._update_boredom_from_thought_repetition()
+                
+                # Predict next vector
+                predicted_next_vector = self.predictor.predict(current_sensory_vector)
+                
+                # Store for next tick
+                self.prediction_from_previous_tick = predicted_next_vector
+                self.previous_sensory_vector = current_sensory_vector
+                
+                # Hash info management
+                current_hash = self.current_sensory_packet.get('lsh_hash', '')
+                if current_hash:
+                    hash_id, hash_info, is_new = self.hash_db.get_or_create_hash_info(current_hash)
+                    optimal_depth = hash_info.get('optimal_depth')
+                    self.state_before_action = self.internal_state.copy()
+                
+                # Run OLM pipeline on the read text
+                if 'text' in self.current_sensory_packet:
+                    # P-LSTM: Discover patterns
+                    pattern_vector = self.pattern_recognizer.process(current_sensory_vector)
+                    
+                    # C-LSTM: Compress patterns
+                    neuro_vector = self.neuro_activator.process(pattern_vector)
+                    
+                    # Train C-LSTM
+                    c_loss = self.neuro_activator.train_with_input(pattern_vector, neuro_vector)
+                    if self.gui and c_loss is not None:
+                        self.gui.log_system(f"C-LSTM Training... Loss: {c_loss:.6f}")
+                    
+                    # Calibrate if needed
+                    if is_new:
+                        calibrated_depths = self._calibrate_new_hash(neuro_vector)
+                        self.hash_db.update_depths(hash_id, calibrated_depths)
+                        optimal_depth = calibrated_depths['optimal']
+                    
+                    if self.gui:
+                        log_msg = f"Using stored depth: {optimal_depth}" if not is_new else f"Using newly calibrated depth: {optimal_depth}"
+                        self.gui.log_system(log_msg)
+                    
+                    # D-LSTMs: Generate thought and text
+                    thought_vector = self.thought_d_lstm.process(neuro_vector, self.internal_state, depth=optimal_depth)
+                    text_vector = self.text_d_lstm.process(neuro_vector, self.internal_state, depth=optimal_depth)
+                    
+                    # Store reading thought vector in history for boredom analysis
+                    self.thought_history.append(thought_vector)
+                    
+                    # Train D-LSTMs
+                    t_loss = self.thought_d_lstm.train(neuro_vector, neuro_vector, optimal_depth)
+                    
+                    # Train TextD_LSTM on actual text input instead of auto-encoding
+                    if 'text' in self.current_sensory_packet:
+                        text_tokens = np.array(self.current_sensory_packet['text']['text'], dtype=np.float32)
+                        s_loss = self.text_d_lstm.train(neuro_vector, text_tokens, optimal_depth)
+                    else:
+                        s_loss = self.text_d_lstm.train(neuro_vector, neuro_vector, optimal_depth)  # Fallback to auto-encoding
+                        
+                    if self.gui and t_loss is not None:
+                        self.gui.log_system(f"D-LSTM Training... Thought Loss: {t_loss:.6f}, Speech Loss: {s_loss:.6f}")
+                    
+                    # Process outputs
+                    thought_tokens = np.round(thought_vector).astype(int)
+                    output_tokens = np.round(text_vector).astype(int)
+                    
+                    # Sanitize outputs
+                    valid_token_ids = set(self.tokenizer.token_to_word.keys()) if hasattr(self.tokenizer, 'token_to_word') else set()
+                    sanitized_thought_tokens = [int(token) for token in thought_tokens 
+                                                if int(token) != 0 and int(token) in valid_token_ids]
+                    sanitized_output_tokens = [int(token) for token in output_tokens 
+                                               if int(token) != 0 and int(token) in valid_token_ids]
+                    
+                    # Store speech tokens
+                    self.last_olm_speech_tokens = output_tokens.tolist()
+                    
+                    # Update token counter in GUI
+                    if self.gui and hasattr(self.gui, 'update_token_counter'):
+                        self.gui.update_token_counter()
+                    
+                    # De-tokenize
+                    thought_text = self.tokenizer.detokenize(sanitized_thought_tokens) if sanitized_thought_tokens else "(Silent Thought)"
+                    output_text = self.tokenizer.detokenize(sanitized_output_tokens) if sanitized_output_tokens else ""
+                    
+                    # Log thoughts only (speech is blocked during reading)
+                    if self.gui:
+                        self.gui.log_thoughts(thought_text)
+                        # Note: output_text is not sent to text_handler or TinyLlama during reading
+                
+                # Check for energy depletion
+                if self.internal_state['Energy'] <= 0:
+                    self.internal_state['Energy'] = 0
+                    self.is_sleeping = True
+                    self.sleep_ticks_remaining = 100
+                    
+                    # Seed the initial dream neuro vector
+                    if self.experience_buffer:
+                        self.current_dream_neuro_vector = random.choice(self.experience_buffer)
+                        if self.gui:
+                            self.gui.log_system("Dream seeded from experience buffer (neuro vectors).")
+                    else:
+                        self.current_dream_neuro_vector = np.zeros(NEUROTRANSMITTER_VECTOR_SIZE)
+                        if self.gui:
+                            self.gui.log_system("Dream seeded with zero neuro vector (no experiences available).")
+                    
+                    if self.gui:
+                        self.gui.log_system("Energy depleted. Entering sleep state.")
+                
+                # Update tick count and GUI
+                tick_count += 1
+                tick_message = f"Reading Tick! #{tick_count}"
+                print(tick_message)
+                
+                if self.gui:
+                    self.gui.update_tps(tick_count)
+                    self.gui.update_internal_state(self.internal_state, self.is_sleeping)
+                    self.gui.log_console(tick_message)
+                
+                # Sleep for tick duration
+                elapsed_time = time.time() - start_time
+                sleep_time = (1.0 / self.tick_rate) - elapsed_time
+                
+                if sleep_time > 0:
+                    remaining_sleep = sleep_time
+                    while remaining_sleep > 0 and self.running:
+                        sleep_chunk = min(0.05, remaining_sleep)
+                        time.sleep(sleep_chunk)
+                        remaining_sleep -= sleep_chunk
+                        
+                        if self.gui:
+                            try:
+                                self.gui.root.update_idletasks()
+                            except:
+                                pass
+                else:
+                    warning_message = f"Warning: Reading Tick #{tick_count} took {elapsed_time:.3f}s (target: {1.0/self.tick_rate:.3f}s)"
+                    if self.gui:
+                        self.gui.log_system(warning_message)
+                    else:
+                        print(warning_message)
+                
+                continue
+
+            else:
+                # --- WAKE CYCLE LOGIC ---
+                
+                # --- Reading State Trigger ---
+                # Check if we should start a reading session
+                if not self.is_sleeping and not self.is_reading:
+                    if (self.internal_state['Boredom'] > 80 and 
+                        self.internal_state['Comfort'] > 60 and 
+                        self.internal_state['Novelty'] < 17.1 and
+                        self.books_read_this_cycle < 1):  # Max 1 book per awake cycle
+                        self._start_reading_session()
+                
+                # --- Comfort Driver Logic ---
+            # Apply natural decay to Comfort
+            self.internal_state['Comfort'] -= 0.02
+            
+            # --- Collect and Process Sensory Inputs ---
+            self.current_sensory_packet = {}  # Reset packet for this tick
+
+            # Check for new text input from any source
+            text_input = self.text_handler.get_latest_input()
+            if text_input is not None:
+                original_text = text_input['text']
+                # Tokenize the text, which also adds new words to the vocabulary
+                tokenized_text = self.tokenizer.tokenize(original_text)
+
+                # Add to the sensory packet
+                self.current_sensory_packet['text'] = {
+                    'source': text_input['source'],
+                    'text': tokenized_text
+                }
+                if self.gui:
+                    self.gui.log_system(f"Text input from [{text_input['source']}] tokenized.")
+                
+                # Process sentiment for TinyLlama responses to update Comfort
+                if text_input['source'] == 'tinyllama':
+                    sentiment_score = self._get_sentiment_score(original_text)
+                    if sentiment_score > 0:
+                        self.internal_state['Comfort'] += 2.0 * sentiment_score
+                    elif sentiment_score < 0:
+                        self.internal_state['Comfort'] += 5.0 * sentiment_score  # Higher penalty for negative sentiment
+                    
+                    if self.gui:
+                        self.gui.log_system(f"TinyLlama sentiment: {sentiment_score}, Comfort adjusted to {self.internal_state['Comfort']:.1f}")
+                        # Also log TinyLlama response to the OLM dialog
+                        if hasattr(self.gui, 'log_olm_dialog'):
+                            self.gui.log_olm_dialog(f"TinyLlama: {original_text}")
+
+            # Check for new keyboard input
+            keyboard_utterance = self.keyboard_listener.get_latest_utterance()
+            if keyboard_utterance is not None:
+                self.current_sensory_packet['keyboard'] = keyboard_utterance
+                if self.gui:
+                    self.gui.log_system(f"Keyboard utterance captured.")
+            
+            # Check if we should capture screen
+            vision_data = None
+            if tick_count % VISION_CAPTURE_INTERVAL == 0:
+                try:
+                    # Capture screen frame
+                    captured_image = self.capturer.capture_frame()
+                    
+                    # Log capture info for debugging
+                    if self.gui:
+                        self.gui.log_system(f"Captured screen at tick {tick_count} - Size: {captured_image.size}")
+                    
+                    # Process the captured frame through the VAE
+                    if self.gui:
+                        self.gui.log_system("Encoding captured frame...")
+                    
+                    # Encode the image to latent space
+                    latent_vector = self.vae.encode(captured_image)
+                    
+                    if self.gui:
+                        self.gui.log_system(f"Latent vector created with shape: {latent_vector.shape}")
+                    
+                    # Update GUI with captured frame
+                    if self.gui:
+                        self.gui.update_vision(captured_image)
+                    
+                    # Store vision data for sensory packet immediately
+                    vision_data = {
+                        'latent_vector': latent_vector,
+                        'image_size': captured_image.size
+                    }
+                    self.current_sensory_packet['vision'] = vision_data
+                        
+                except Exception as e:
+                    error_msg = f"Error capturing screen at tick {tick_count}: {str(e)}"
+                    if self.gui:
+                        self.gui.log_system(error_msg)
+                    else:
+                        print(error_msg)
+            
+            # Accumulation already handled when inputs were collected above
+            
+            # Generate LSH hash for the current sensory packet
+            if self.current_sensory_packet:
+                current_hash = self.lsh_system.generate_hash(self.current_sensory_packet, self.last_tick_hash)
+                
+                # Log the new hash to the system log
+                if self.gui:
+                    self.gui.log_system(f"Generated LSH hash: {current_hash[:16]}...")
+                
+                # Update the last hash for the next tick
+                self.last_tick_hash = current_hash
+                
+                # Add the current hash to the sensory packet
+                self.current_sensory_packet['lsh_hash'] = current_hash
+            
+            # --- Prediction, Error Calculation, and Visualization ---
+
+            # 1. Create the sensory vector for the current state
+            current_sensory_vector = self._create_sensory_vector(self.current_sensory_packet)
+            
+            # Note: Experience buffer now stores neuro_vectors instead of sensory_vectors
+            # Neuro vectors are added to the buffer in the OLM pipeline section
+
+            # 2. If a prediction from the last tick exists, calculate the error
+            if self.prediction_from_previous_tick is not None:
+                # Calculate Mean Squared Error between the last prediction and the current actual vector
+                prediction_error = np.mean((self.prediction_from_previous_tick - current_sensory_vector)**2)
+
+                # Log the error, which represents novelty
+                if self.gui:
+                    self.gui.log_system(f"Prediction Error (Novelty): {prediction_error:.6f}")
+                    # Update the GUI's prediction error display
+                    self.gui.update_prediction_error(prediction_error)
+                
+                # Scale the raw MSE to a more behaviorally useful 0-100 range
+                NOVELTY_SCALING_FACTOR = 10000
+                scaled_novelty = prediction_error * NOVELTY_SCALING_FACTOR
+                
+                # Update internal state, capping the novelty at 100
+                self.internal_state['Novelty'] = min(scaled_novelty, 100.0)
+
+                # TODO: Use this error to train the predictor and influence Drivers
+                # self.predictor.train(self.previous_sensory_vector, current_sensory_vector)
+            else:
+                # No prediction available yet, update GUI to show no data
+                if self.gui:
+                    self.gui.update_prediction_error(None)
+
+            # --- Boredom Driver Logic ---
+            # High novelty events completely eliminate boredom
+            if self.internal_state['Novelty'] > 100.0:
+                self.internal_state['Boredom'] = 0
+            # Low novelty causes boredom to increase
+            elif self.internal_state['Novelty'] < 50.0:
+                self.internal_state['Boredom'] += 0.1
+            
+            # Clamp Boredom between 0 and 100
+            self.internal_state['Boredom'] = max(0, min(100, self.internal_state['Boredom']))
+            
+            # Update boredom based on thought repetition
+            self._update_boredom_from_thought_repetition()
+            
+            # Clamp Comfort between 0 and 100 (global bounds checking)
+            self.internal_state['Comfort'] = max(0, min(100, self.internal_state['Comfort']))
+            
+            # Update GUI to show driver changes immediately
+            if self.gui:
+                self.gui.update_internal_state(self.internal_state, self.is_sleeping)
+
+            # 3. Predict the sensory vector for the *next* tick based on the *current* vector
+            predicted_next_vector = self.predictor.predict(current_sensory_vector)
+
+            # 4. Decode the vision part of the new prediction for visualization
+            if self.gui:
+                try:
+                    # Extract the vision component (first 128 elements)
+                    predicted_latent_vector = predicted_next_vector[:128]
+
+                    # Decode the latent vector back into an image
+                    predicted_image = self.vae.decode(predicted_latent_vector)
+
+                    # Update the GUI's prediction panel
+                    self.gui.update_prediction(predicted_image)
+
+                except Exception as e:
+                    # Log any errors during the decoding/display process
+                    error_msg = f"Error decoding/displaying prediction: {e}"
+                    self.gui.log_system(error_msg)
+
+            # 5. Store the current prediction and vector for the next tick's comparison
+            self.prediction_from_previous_tick = predicted_next_vector
+            self.previous_sensory_vector = current_sensory_vector
+            
+            # --- Hash Info Management & State Tracking ---
+            
+            # Track the change in internal state from the last action
+            if self.last_tick_hash and self.state_before_action:
+                # Get the ID of the hash that *led to* the last action
+                last_hash_id, _, _ = self.hash_db.get_or_create_hash_info(self.last_tick_hash)
+
+                # Calculate the change in state
+                state_changes = {
+                    driver: self.internal_state[driver] - self.state_before_action[driver]
+                    for driver in self.internal_state
+                }
+
+                # Update the database with the observed impact
+                self.hash_db.update_state_impact(last_hash_id, state_changes)
+
+            # Get or create the info for the CURRENT hash
+            current_hash = self.current_sensory_packet.get('lsh_hash', '')
+            if current_hash:
+                hash_id, hash_info, is_new = self.hash_db.get_or_create_hash_info(current_hash)
+
+                # Placeholder for depths, will be calibrated in the main pipeline if new
+                optimal_depth = hash_info.get('optimal_depth')
+
+                # Store the current internal state *before* the next action is taken
+                self.state_before_action = self.internal_state.copy()
+            
+                        # --- Main OLM Pipeline ---
+            if 'vision' in self.current_sensory_packet or 'text' in self.current_sensory_packet or 'keyboard' in self.current_sensory_packet:
+                # 1. P-LSTM: Discover patterns from the sensory vector
+                pattern_vector = self.pattern_recognizer.process(current_sensory_vector)
+
+                # 2. C-LSTM: Compress patterns into a neurotransmitter vector
+                neuro_vector = self.neuro_activator.process(pattern_vector)
+
+                # Add neuro_vector to the experience buffer for dream seeding
+                self.experience_buffer.append(neuro_vector)
+                if len(self.experience_buffer) > self.experience_buffer_max_size:
+                    self.experience_buffer.pop(0)
+
+                # Train the neuro predictor on the neuro vector sequence
+                self.neuro_predictor.add_to_buffer(neuro_vector)
+
+                # >> C-LSTM Training Step <<
+                # Train the Neuro Activator to better represent the current pattern vector.
+                c_loss = self.neuro_activator.train_with_input(pattern_vector, neuro_vector)
+                if self.gui and c_loss is not None:
+                    self.gui.log_system(f"C-LSTM Training... Loss: {c_loss:.6f}")
+
+                # 3. Check if calibration is needed for the current hash
+                if is_new:
+                    # Calibrate to find the best depths and save them
+                    calibrated_depths = self._calibrate_new_hash(neuro_vector)
+                    self.hash_db.update_depths(hash_id, calibrated_depths)
+                    optimal_depth = calibrated_depths['optimal']
+
+                # Log which depth is being used for this tick
+                if self.gui:
+                    log_msg = f"Using stored depth: {optimal_depth}" if not is_new else f"Using newly calibrated depth: {optimal_depth}"
+                    self.gui.log_system(log_msg)
+
+                # Calculate dynamic temperature based on boredom level
+                current_boredom = self.internal_state['Boredom']
+                dynamic_temperature = 1.0 + (current_boredom / 100.0) * 0.5
+
+                # 4. D-LSTMs: Generate thought and text using the determined depth and dynamic temperature
+                thought_vector = self.thought_d_lstm.process(neuro_vector, self.internal_state, depth=optimal_depth, temperature=dynamic_temperature)
+                text_vector = self.text_d_lstm.process(neuro_vector, self.internal_state, depth=optimal_depth, temperature=dynamic_temperature)
+                
+                # Store thought vector in history for boredom analysis
+                self.thought_history.append(thought_vector)
+
+                # >> D-LSTMs Training Step <<
+                # Train the D-LSTMs to better reflect the current neuro_vector.
+                # This is a simple starting point for training.
+                t_loss = self.thought_d_lstm.train(neuro_vector, neuro_vector, optimal_depth)
+                
+                # Train TextD_LSTM on actual text input instead of auto-encoding
+                if 'text' in self.current_sensory_packet:
+                    text_tokens = np.array(self.current_sensory_packet['text']['text'], dtype=np.float32)
+                    s_loss = self.text_d_lstm.train(neuro_vector, text_tokens, optimal_depth)
+                else:
+                    s_loss = self.text_d_lstm.train(neuro_vector, neuro_vector, optimal_depth)  # Fallback to auto-encoding
+                    
+                if self.gui and t_loss is not None:
+                    self.gui.log_system(f"D-LSTM Training... Thought Loss: {t_loss:.6f}, Speech Loss: {s_loss:.6f}")
+
+                # 5. De-tokenize, sanitize, and route the outputs
+                thought_tokens = np.round(thought_vector).astype(int)
+                output_tokens = np.round(text_vector).astype(int)
+
+                # --- NEW: Sanitize outputs by removing the <unk> token (ID 0)
+                # and any token IDs that are not in the tokenizer's vocabulary ---
+                valid_token_ids = set(self.tokenizer.token_to_word.keys()) if hasattr(self.tokenizer, 'token_to_word') else set()
+                sanitized_thought_tokens = [int(token) for token in thought_tokens 
+                                            if int(token) != 0 and int(token) in valid_token_ids]
+                sanitized_output_tokens = [int(token) for token in output_tokens 
+                                           if int(token) != 0 and int(token) in valid_token_ids]
+
+                # Store the original unfiltered speech tokens for the next tick's sensory vector
+                self.last_olm_speech_tokens = output_tokens.tolist()
+
+                # Update token counter in GUI
+                if self.gui and hasattr(self.gui, 'update_token_counter'):
+                    self.gui.update_token_counter()
+
+                # De-tokenize the sanitized lists
+                thought_text = self.tokenizer.detokenize(sanitized_thought_tokens) if sanitized_thought_tokens else "(Silent Thought)"
+                output_text = self.tokenizer.detokenize(sanitized_output_tokens) if sanitized_output_tokens else ""
+
+                # 6. Log and route the sanitized outputs
+                if self.gui:
+                    self.gui.log_thoughts(thought_text)
+                    speech_log_msg = output_text if output_text else "(Silence)"
+                    self.gui.log_speech(speech_log_msg)
+                    # Mirror OLM speech into the dedicated dialog panel
+                    if hasattr(self.gui, 'log_olm_dialog'):
+                        self.gui.log_olm_dialog(speech_log_msg)
+
+                # Feed the OLM's external output (if any) back into the system and to TinyLlama
+                if output_text:
+                    self.text_handler.add_message(output_text, source='olm')
+                    self.tinyllama_manager.submit_prompt(output_text)
+
+                # 7. Calculate and apply energy consumption for this tick
+                thought_cost = 0.002
+                # Use the length of the sanitized output for a more accurate speech cost
+                speech_cost = 0.02 * (len(sanitized_output_tokens)) 
+                decay_cost = 0.15
+                total_cost = thought_cost + speech_cost + decay_cost
+                self.internal_state['Energy'] -= total_cost
+
+                # 8. Check for state transition to sleep
+                if self.internal_state['Energy'] <= 0:
+                    self.internal_state['Energy'] = 0
+                    self.is_sleeping = True
+                    self.sleep_ticks_remaining =100  # Sleep for 30 ticks
+                    
+                    # Seed the initial dream neuro vector
+                    if self.experience_buffer:
+                        self.current_dream_neuro_vector = random.choice(self.experience_buffer)
+                        if self.gui:
+                            self.gui.log_system("Dream seeded from experience buffer (neuro vectors).")
+                    else:
+                        self.current_dream_neuro_vector = np.zeros(NEUROTRANSMITTER_VECTOR_SIZE)
+                        if self.gui:
+                            self.gui.log_system("Dream seeded with zero neuro vector (no experiences available).")
+                    
+                    if self.gui:
+                        self.gui.log_system("Energy depleted. Entering sleep state.")
+            
+            # Periodically save tokenizer state to persist vocabulary growth
+            if tick_count % CHECKPOINT_SAVE_INTERVAL == 0:
+                self.tokenizer.save_state()
+                # Also save the prediction model state
+                predictor_checkpoint_file = os.path.join(self.checkpoints_dir, "prediction_model.pth")
+                self.predictor.save_model(predictor_checkpoint_file)
+                if self.gui:
+                    self.gui.log_system("Periodically saved prediction model.")
+
+            # Log sensory packet summary periodically
+            if tick_count % PACKET_SUMMARY_INTERVAL == 0 and self.gui:
+                summary_parts = []
+                
+                if 'vision' in self.current_sensory_packet:
+                    summary_parts.append("Vision: Yes")
+                
+                if 'text' in self.current_sensory_packet:
+                    # Handle tokenized text for display
+                    text_data = self.current_sensory_packet['text']['text']
+                    if isinstance(text_data, list):  # Tokenized text
+                        text_preview = f"[{len(text_data)} tokens]"
+                    else:  # Raw text (fallback)
+                        text_preview = str(text_data)[:20]
+                        if len(str(text_data)) > 20:
+                            text_preview += "..."
+                    summary_parts.append(f"Text: {text_preview}")
+                
+                if 'keyboard' in self.current_sensory_packet:
+                    event_count = len(self.current_sensory_packet['keyboard']['events'])
+                    summary_parts.append(f"Keyboard: {event_count} events")
+                
+                if 'lsh_hash' in self.current_sensory_packet:
+                    hash_preview = self.current_sensory_packet['lsh_hash'][:8]
+                    summary_parts.append(f"Hash: {hash_preview}...")
+                
+                if summary_parts:
+                    summary_string = f"Packet: {' | '.join(summary_parts)}"
+                    self.gui.log_sensory_packet(summary_string)
+                else:
+                    self.gui.log_sensory_packet("Packet: Empty")
+            
+            # TODO: Pass the final sensory_packet to the OLM's main tick method
+            
+            # --- TICK LOGIC GOES HERE ---
+            tick_count += 1
+            tick_message = f"Tick! #{tick_count}"
+            print(tick_message)
+            
+            # Update TPS counter in GUI
+            if self.gui:
+                self.gui.update_tps(tick_count)
+                # Also keep internal panel refreshed during wake cycle
+                self.gui.update_internal_state(self.internal_state, self.is_sleeping)
+            
+            # Also log to console log if GUI is available
+            if self.gui:
+                self.gui.log_console(tick_message)
+            
+            # Calculate time elapsed for this tick's logic
+            elapsed_time = time.time() - start_time
+            
+            # Calculate required sleep time to maintain tick rate
+            sleep_time = (1.0 / self.tick_rate) - elapsed_time
+            
+            # Sleep if there's time remaining in the tick
+            if sleep_time > 0:
+                # Use shorter sleep intervals to keep GUI responsive
+                remaining_sleep = sleep_time
+                while remaining_sleep > 0 and self.running:
+                    sleep_chunk = min(0.05, remaining_sleep)  # Max 50ms chunks
+                    time.sleep(sleep_chunk)
+                    remaining_sleep -= sleep_chunk
+                    
+                    # Force GUI update during sleep to prevent freezing
+                    if self.gui:
+                        try:
+                            self.gui.root.update_idletasks()
+                        except:
+                            pass
+            else:
+                # Log if we're falling behind
+                warning_message = f"Warning: Tick #{tick_count} took {elapsed_time:.3f}s (target: {1.0/self.tick_rate:.3f}s)"
+                if self.gui:
+                    self.gui.log_system(warning_message)
+                else:
+                    print(warning_message)
+                    
+        # Engine has stopped
+        stop_message = "Engine stopped."
+        if self.gui:
+            self.gui.log_system(stop_message)
+        else:
+            print(stop_message)
+            
+    def ensure_checkpoints_dir(self):
+        """Create checkpoints directory if it doesn't exist"""
+        if not os.path.exists(self.checkpoints_dir):
+            os.makedirs(self.checkpoints_dir)
+            if self.gui:
+                self.gui.log_system(f"Created checkpoints directory: {self.checkpoints_dir}")
+            else:
+                print(f"Created checkpoints directory: {self.checkpoints_dir}")
+                
+    def wipe_checkpoints(self):
+        """Delete all files in the checkpoints, dream_logs, and logs directories"""
+        total_deleted = 0
+        
+        # Wipe checkpoints directory
+        if os.path.exists(self.checkpoints_dir):
+            try:
+                files = os.listdir(self.checkpoints_dir)
+                deleted_count = 0
+                
+                for file in files:
+                    file_path = os.path.join(self.checkpoints_dir, file)
+                    if os.path.isfile(file_path):
+                        os.remove(file_path)
+                        deleted_count += 1
+                    elif os.path.isdir(file_path):
+                        import shutil
+                        shutil.rmtree(file_path)
+                        deleted_count += 1
+                
+                total_deleted += deleted_count
+                if self.gui:
+                    self.gui.log_system(f"Wiped checkpoints directory: {deleted_count} items deleted")
+                else:
+                    print(f"Wiped checkpoints directory: {deleted_count} items deleted")
+                    
+            except Exception as e:
+                error_msg = f"Error wiping checkpoints: {str(e)}"
+                if self.gui:
+                    self.gui.log_system(error_msg)
+                else:
+                    print(error_msg)
+        else:
+            if self.gui:
+                self.gui.log_system("Checkpoints directory does not exist")
+            else:
+                print("Checkpoints directory does not exist")
+        
+        # Wipe dream_logs directory
+        if os.path.exists(self.dream_logs_dir):
+            try:
+                files = os.listdir(self.dream_logs_dir)
+                deleted_count = 0
+                
+                for file in files:
+                    file_path = os.path.join(self.dream_logs_dir, file)
+                    if os.path.isfile(file_path):
+                        os.remove(file_path)
+                        deleted_count += 1
+                    elif os.path.isdir(file_path):
+                        import shutil
+                        shutil.rmtree(file_path)
+                        deleted_count += 1
+                
+                total_deleted += deleted_count
+                if self.gui:
+                    self.gui.log_system(f"Wiped dream_logs directory: {deleted_count} items deleted")
+                else:
+                    print(f"Wiped dream_logs directory: {deleted_count} items deleted")
+                    
+            except Exception as e:
+                error_msg = f"Error wiping dream_logs: {str(e)}"
+                if self.gui:
+                    self.gui.log_system(error_msg)
+                else:
+                    print(error_msg)
+        else:
+            if self.gui:
+                self.gui.log_system("Dream_logs directory does not exist")
+            else:
+                print("Dream_logs directory does not exist")
+        
+        # Wipe logs directory
+        logs_dir = "logs"
+        if os.path.exists(logs_dir):
+            try:
+                files = os.listdir(logs_dir)
+                deleted_count = 0
+                
+                for file in files:
+                    file_path = os.path.join(logs_dir, file)
+                    if os.path.isfile(file_path):
+                        os.remove(file_path)
+                        deleted_count += 1
+                    elif os.path.isdir(file_path):
+                        import shutil
+                        shutil.rmtree(file_path)
+                        deleted_count += 1
+                
+                total_deleted += deleted_count
+                if self.gui:
+                    self.gui.log_system(f"Wiped logs directory: {deleted_count} items deleted")
+                else:
+                    print(f"Wiped logs directory: {deleted_count} items deleted")
+                    
+            except Exception as e:
+                error_msg = f"Error wiping logs: {str(e)}"
+                if self.gui:
+                    self.gui.log_system(error_msg)
+                else:
+                    print(error_msg)
+        else:
+            if self.gui:
+                self.gui.log_system("Logs directory does not exist")
+            else:
+                print("Logs directory does not exist")
+        
+        # Summary
+        if self.gui:
+            self.gui.log_system(f"Total items deleted across all directories: {total_deleted}")
+        else:
+            print(f"Total items deleted across all directories: {total_deleted}")

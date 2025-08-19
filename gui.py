@@ -1,0 +1,1030 @@
+import tkinter as tk
+from tkinter import ttk
+import sys
+import io
+from PIL import Image, ImageTk
+
+class App:
+    def __init__(self, engine=None):
+        # Store engine reference
+        self.engine = engine
+        
+        # TPS tracking variables
+        self.tps_start_time = None
+        self.tps_tick_count = 0
+        self.tps_history = []  # Store recent TPS values for averaging
+        self.target_tps = 20.0
+        
+        # Create main window
+        self.root = tk.Tk()
+        
+        # Dream logging control variable (must be created after root window)
+        self.dream_log_var = tk.BooleanVar(value=False)
+        self.root.title("OLM Observer")
+        self.root.configure(bg='#2b2b2b')  # Dark grey background
+        
+        # Set window size and make it resizable
+        self.root.geometry("1200x800")
+        self.root.minsize(800, 600)
+        
+        # Configure grid weights for responsive layout
+        self.root.grid_rowconfigure(0, weight=1)
+        self.root.grid_rowconfigure(1, weight=0)
+        self.root.grid_rowconfigure(2, weight=0)
+        self.root.grid_columnconfigure(0, weight=1)
+        self.root.grid_columnconfigure(1, weight=0)
+        
+        # Set up close protocol
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        
+        self.setup_top_section()
+        self.setup_right_sidebar()
+        self.setup_olm_dialog_section()
+        self.setup_bottom_section()
+        
+        # Set up console output redirection
+        self.setup_console_redirection()
+        
+    def setup_top_section(self):
+        """Create the top section with vision displays"""
+        # Main container for top section
+        top_frame = tk.Frame(self.root, bg='#2b2b2b')
+        top_frame.grid(row=0, column=0, sticky='nsew', padx=10, pady=(10, 5))
+        
+        # Configure grid weights for top frame
+        top_frame.grid_columnconfigure(0, weight=1)
+        top_frame.grid_columnconfigure(1, weight=1)
+        
+        # Left side - Current Vision
+        vision_frame = tk.Frame(top_frame, bg='#2b2b2b')
+        vision_frame.grid(row=0, column=0, sticky='nsew', padx=(0, 5))
+        
+        # Create a canvas for vision display instead of a label
+        vision_canvas = tk.Canvas(vision_frame, 
+                                 bg='#1e1e1e', 
+                                 relief='solid', bd=1,
+                                 width=600, height=400)  # Set actual pixel dimensions
+        vision_canvas.pack(pady=10, fill='both', expand=True)
+        
+        # Add a label on top of the canvas
+        vision_canvas.create_text(300, 20, text="Vision Input", 
+                                 fill='white', font=('Arial', 12, 'bold'))
+        
+        # Right side - Predicted Vision
+        prediction_frame = tk.Frame(top_frame, bg='#2b2b2b')
+        prediction_frame.grid(row=0, column=1, sticky='nsew', padx=(5, 0))
+        
+        # Create a canvas for prediction display
+        prediction_canvas = tk.Canvas(prediction_frame, 
+                                     bg='#1e1e1e', 
+                                     relief='solid', bd=1,
+                                     width=600, height=400)  # Set actual pixel dimensions
+        prediction_canvas.pack(pady=10, fill='both', expand=True)
+        
+        # Add a label on top of the canvas
+        prediction_canvas.create_text(300, 20, text="Prediction Output", 
+                                     fill='white', font=('Arial', 12, 'bold'))
+        
+        # Store references for later updates
+        self.vision_canvas = vision_canvas
+        self.prediction_canvas = prediction_canvas
+        
+    def setup_right_sidebar(self):
+        """Create the right sidebar for internal state"""
+        # Right sidebar container
+        sidebar_frame = tk.Frame(self.root, bg='#2b2b2b', width=300)
+        sidebar_frame.grid(row=0, column=1, rowspan=2, sticky='nsew', padx=(0, 10), pady=10)
+        sidebar_frame.grid_propagate(False)  # Maintain fixed width
+        
+        # Title
+        title_label = tk.Label(sidebar_frame, text="Internal State", 
+                              bg='#2b2b2b', fg='white', 
+                              font=('Arial', 14, 'bold'))
+        title_label.pack(pady=(10, 5))
+        
+        # TPS counter frame
+        tps_frame = tk.Frame(sidebar_frame, bg='#2b2b2b')
+        tps_frame.pack(fill='x', padx=10, pady=(5, 5))
+        
+        # TPS label
+        tps_label = tk.Label(tps_frame, text="TPS Counter", 
+                           bg='#2b2b2b', fg='white', 
+                           font=('Arial', 10, 'bold'))
+        tps_label.pack(anchor='w', pady=(0, 5))
+        
+        # TPS display
+        self.tps_label = tk.Label(tps_frame, 
+                                text="Current TPS: 0.0\n"
+                                     "Target TPS: 20.0\n"
+                                     "Average TPS: 0.0",
+                                bg='#1e1e1e', fg='#00FF00',  # Green text for TPS
+                                font=('Consolas', 10, 'bold'),
+                                justify=tk.LEFT, anchor='nw',
+                                relief='solid', bd=1)
+        self.tps_label.pack(fill='x', pady=(0, 5))
+        
+        # Prediction Error frame
+        error_frame = tk.Frame(sidebar_frame, bg='#2b2b2b')
+        error_frame.pack(fill='x', padx=10, pady=(5, 5))
+        
+        # Prediction Error label
+        error_label = tk.Label(error_frame, text="Prediction Error", 
+                             bg='#2b2b2b', fg='white', 
+                             font=('Arial', 10, 'bold'))
+        error_label.pack(anchor='w', pady=(0, 5))
+        
+        # Prediction Error display
+        self.error_label = tk.Label(error_frame, 
+                                  text="Error: 0.000000\n"
+                                       "Status: No Data",
+                                  bg='#1e1e1e', fg='#FFD700',  # Gold text for error
+                                  font=('Consolas', 10, 'bold'),
+                                  justify=tk.LEFT, anchor='nw',
+                                  relief='solid', bd=1)
+        self.error_label.pack(fill='x', pady=(0, 5))
+        
+        # Status display
+        self.status_label = tk.Label(sidebar_frame, 
+                                    text="State: Awake\n"
+                                         "---Constraints---\n"
+                                         "Energy: 100.0\n"
+                                         "Comfort: 75.0\n"
+                                         "Confidence: 50.0\n"
+                                         "---Drivers---\n"
+                                         "Novelty: 0.0\n"
+                                         "Boredom: 0.0",
+                                    bg='#1e1e1e', fg='white',
+                                    font=('Consolas', 10),
+                                    justify=tk.LEFT, anchor='nw',
+                                    relief='solid', bd=1)
+        self.status_label.pack(fill='both', expand=True, padx=10, pady=5)
+        
+        # User input frame
+        user_input_frame = tk.Frame(sidebar_frame, bg='#2b2b2b')
+        user_input_frame.pack(fill='x', padx=10, pady=(10, 5))
+        
+        # User input label
+        user_input_label = tk.Label(user_input_frame, text="User Message Input", 
+                                   bg='#2b2b2b', fg='white', 
+                                   font=('Arial', 10, 'bold'))
+        user_input_label.pack(anchor='w', pady=(0, 5))
+        
+        # User input entry and send button frame
+        input_controls_frame = tk.Frame(user_input_frame, bg='#2b2b2b')
+        input_controls_frame.pack(fill='x')
+        
+        # User input entry
+        self.user_input_entry = tk.Entry(input_controls_frame, 
+                                        bg='#1e1e1e', fg='white',
+                                        font=('Arial', 10),
+                                        relief='solid', bd=1)
+        self.user_input_entry.pack(side='left', fill='x', expand=True, padx=(0, 5))
+        
+        # Send button
+        self.send_button = tk.Button(input_controls_frame, text="Send", 
+                                   bg='#2196F3', fg='white',
+                                   font=('Arial', 10, 'bold'),
+                                   command=self.send_user_message,
+                                   relief='flat', bd=0,
+                                   width=8)
+        self.send_button.pack(side='right')
+        
+        # Bind Enter key to send message
+        self.user_input_entry.bind('<Return>', lambda event: self.send_user_message())
+        
+        # Control buttons frame
+        control_frame = tk.Frame(sidebar_frame, bg='#2b2b2b')
+        control_frame.pack(fill='x', padx=10, pady=10)
+        
+        # Start button
+        self.start_button = tk.Button(control_frame, text="Start", 
+                                     bg='#4CAF50', fg='white',
+                                     font=('Arial', 12, 'bold'),
+                                     command=self.start_engine,
+                                     relief='flat', bd=0,
+                                     width=10, height=2)
+        self.start_button.pack(side='left', padx=(0, 5))
+        
+        # Stop button
+        self.stop_button = tk.Button(control_frame, text="Stop", 
+                                    bg='#f44336', fg='white',
+                                    font=('Arial', 12, 'bold'),
+                                    command=self.stop_engine,
+                                    relief='flat', bd=0,
+                                    width=10, height=2)
+        self.stop_button.pack(side='left', padx=(5, 5))
+        
+        # Wipe button
+        self.wipe_button = tk.Button(control_frame, text="Wipe", 
+                                    bg='#FF9800', fg='white',
+                                    font=('Arial', 12, 'bold'),
+                                    command=self.wipe_checkpoints,
+                                    relief='flat', bd=0,
+                                    width=10, height=2)
+        self.wipe_button.pack(side='right', padx=(5, 0))
+        
+        # Reading button frame (separate from main controls)
+        reading_frame = tk.Frame(sidebar_frame, bg='#2b2b2b')
+        reading_frame.pack(fill='x', padx=10, pady=(5, 10))
+        
+        # Reading button
+        self.reading_button = tk.Button(reading_frame, text="📖 Start Reading", 
+                                       bg='#9C27B0', fg='white',
+                                       font=('Arial', 12, 'bold'),
+                                       command=self.start_reading_session,
+                                       relief='flat', bd=0,
+                                       width=15, height=2,
+                                       state='disabled')  # Initially disabled
+        self.reading_button.pack(fill='x')
+        
+        # Reading constraints labels frame
+        constraints_frame = tk.Frame(reading_frame, bg='#2b2b2b')
+        constraints_frame.pack(fill='x', pady=(5, 0))
+        
+        # Constraints title
+        constraints_title = tk.Label(constraints_frame, text="Reading Constraints:", 
+                                   bg='#2b2b2b', fg='white', 
+                                   font=('Arial', 9, 'bold'))
+        constraints_title.pack(anchor='w', pady=(0, 2))
+        
+        # Individual constraint labels
+        self.boredom_constraint_label = tk.Label(constraints_frame, 
+                                               text="Boredom > 80: 0.0", 
+                                               bg='#2b2b2b', fg='#FF0000',  # Red initially
+                                               font=('Consolas', 8))
+        self.boredom_constraint_label.pack(anchor='w')
+        
+        self.comfort_constraint_label = tk.Label(constraints_frame, 
+                                               text="Comfort > 60: 0.0", 
+                                               bg='#2b2b2b', fg='#FF0000',  # Red initially
+                                               font=('Consolas', 8))
+        self.comfort_constraint_label.pack(anchor='w')
+        
+        self.novelty_constraint_label = tk.Label(constraints_frame, 
+                                               text="Novelty < 17.1: 0.0", 
+                                               bg='#2b2b2b', fg='#FF0000',  # Red initially
+                                               font=('Consolas', 8))
+        self.novelty_constraint_label.pack(anchor='w')
+        
+        # Token counter frame
+        token_frame = tk.Frame(sidebar_frame, bg='#2b2b2b')
+        token_frame.pack(fill='x', padx=10, pady=(10, 5))
+        
+        # Token counter label
+        token_label = tk.Label(token_frame, text="Token Counter", 
+                             bg='#2b2b2b', fg='white', 
+                             font=('Arial', 10, 'bold'))
+        token_label.pack(anchor='w', pady=(0, 5))
+        
+        # Token counter display
+        self.token_counter_label = tk.Label(token_frame, 
+                                          text="Vocabulary Size: 0\n"
+                                               "Total Tokens: 0\n"
+                                               "Last Tokens: None",
+                                          bg='#1e1e1e', fg='#00FFFF',  # Cyan text for tokens
+                                          font=('Consolas', 10, 'bold'),
+                                          justify=tk.LEFT, anchor='nw',
+                                          relief='solid', bd=1)
+        self.token_counter_label.pack(fill='x', pady=(0, 5))
+        
+        # Dream logging checkbox frame
+        dream_log_frame = tk.Frame(sidebar_frame, bg='#2b2b2b')
+        dream_log_frame.pack(fill='x', padx=10, pady=(5, 5))
+        
+        # Dream logging checkbox
+        self.dream_log_checkbox = tk.Checkbutton(dream_log_frame, 
+                                                text="Enable Dream Logging",
+                                                variable=self.dream_log_var,
+                                                command=self.toggle_dream_logging,
+                                                bg='#2b2b2b', fg='white',
+                                                selectcolor='#1e1e1e',
+                                                font=('Arial', 10),
+                                                activebackground='#2b2b2b',
+                                                activeforeground='white')
+        self.dream_log_checkbox.pack(anchor='w')
+        
+        # Print log button frame
+        log_frame = tk.Frame(sidebar_frame, bg='#2b2b2b')
+        log_frame.pack(fill='x', padx=10, pady=(5, 10))
+        
+        # Print log button
+        self.print_log_button = tk.Button(log_frame, text="📄 Print Log", 
+                                         bg='#607D8B', fg='white',
+                                         font=('Arial', 12, 'bold'),
+                                         command=self.print_log_report,
+                                         relief='flat', bd=0,
+                                         width=15, height=2)
+        self.print_log_button.pack(fill='x')
+
+    def setup_olm_dialog_section(self):
+        """Create a large dialog container showing only OLM speech/messages."""
+        dialog_frame = tk.Frame(self.root, bg='#2b2b2b')
+        dialog_frame.grid(row=1, column=0, sticky='nsew', padx=10, pady=(5, 5))
+
+        # Title
+        title = tk.Label(dialog_frame, text="OLM Dialog", bg='#2b2b2b', fg='white', font=('Arial', 12, 'bold'))
+        title.pack(anchor='w', pady=(0, 5))
+
+        # Large text area
+        self.olm_dialog_text = tk.Text(
+            dialog_frame,
+            bg='#1e1e1e', fg='white',
+            font=('Consolas', 11),
+            height=8,
+            state='disabled',
+            relief='solid', bd=1
+        )
+        self.olm_dialog_text.pack(fill='both', expand=True)
+
+        # Scrollbar
+        scrollbar = tk.Scrollbar(dialog_frame, orient='vertical', command=self.olm_dialog_text.yview)
+        scrollbar.pack(side='right', fill='y')
+        self.olm_dialog_text.configure(yscrollcommand=scrollbar.set)
+
+    def log_olm_dialog(self, message: str):
+        """Append a line to the OLM dialog container."""
+        try:
+            if hasattr(self, 'olm_dialog_text') and self.olm_dialog_text:
+                self.olm_dialog_text.config(state='normal')
+                import datetime
+                timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+                self.olm_dialog_text.insert(tk.END, f"[{timestamp}] {message}\n")
+                self.olm_dialog_text.see(tk.END)
+                self.olm_dialog_text.config(state='disabled')
+            else:
+                # Fallback to system log if OLM dialog widget is not available
+                self.log_system(f"OLM Dialog: {message}")
+        except Exception as e:
+            # Log the error to system log instead of silently failing
+            self.log_system(f"Error in log_olm_dialog: {str(e)}")
+            # Also try to log the original message to system log
+            self.log_system(f"OLM Dialog (fallback): {message}")
+        
+    def setup_bottom_section(self):
+        """Create the bottom section with five log panels"""
+        # Bottom container
+        bottom_frame = tk.Frame(self.root, bg='#2b2b2b')
+        bottom_frame.grid(row=2, column=0, columnspan=2, sticky='ew', padx=10, pady=(5, 10))
+        
+        # Configure grid weights for five columns
+        bottom_frame.grid_columnconfigure(0, weight=1)
+        bottom_frame.grid_columnconfigure(1, weight=1)
+        bottom_frame.grid_columnconfigure(2, weight=1)
+        bottom_frame.grid_columnconfigure(3, weight=1)
+        bottom_frame.grid_columnconfigure(4, weight=1)
+        
+        # Speech Log (left)
+        self.setup_log_panel(bottom_frame, "Speech Log", 0, "speech_log")
+        
+        # System Log (middle-left)
+        self.setup_log_panel(bottom_frame, "System Log", 1, "system_log")
+        
+        # Console Log (middle)
+        self.setup_log_panel(bottom_frame, "Console Log", 2, "console_log")
+        
+        # Internal Thoughts Log (right)
+        self.setup_log_panel(bottom_frame, "Internal Thoughts", 3, "thoughts_log")
+        
+        # Sensory Packet Log (far right)
+        self.setup_log_panel(bottom_frame, "Sensory Packet Log", 4, "sensory_log")
+        
+    def setup_log_panel(self, parent, title, column, attr_name):
+        """Helper method to create a log panel"""
+        # Container for this log
+        log_container = tk.Frame(parent, bg='#2b2b2b')
+        # Add padding between panels, but not after the last one
+        if column < 4:  # All but the last column
+            log_container.grid(row=0, column=column, sticky='nsew', padx=(0, 5))
+        else:  # Last column
+            log_container.grid(row=0, column=column, sticky='nsew', padx=(0, 0))
+        
+        # Label
+        label = tk.Label(log_container, text=title, 
+                        bg='#2b2b2b', fg='white', 
+                        font=('Arial', 10, 'bold'))
+        label.pack(anchor='w', pady=(0, 5))
+        
+        # Text widget
+        text_widget = tk.Text(log_container, 
+                             bg='#1e1e1e', fg='white',
+                             font=('Consolas', 9),
+                             height=8,  # Reduced height for three panels
+                             state='disabled',  # Read-only
+                             relief='solid', bd=1)
+        text_widget.pack(fill='both', expand=True)
+        
+        # Scrollbar
+        scrollbar = tk.Scrollbar(log_container, orient='vertical', command=text_widget.yview)
+        scrollbar.pack(side='right', fill='y')
+        text_widget.configure(yscrollcommand=scrollbar.set)
+        
+        # Store reference
+        setattr(self, attr_name, text_widget)
+        
+    def setup_console_redirection(self):
+        """Set up console output redirection to capture print statements"""
+        # Store original stdout
+        self.original_stdout = sys.stdout
+        
+        # Create a custom stdout that redirects to our console log
+        class ConsoleRedirector:
+            def __init__(self, gui_app):
+                self.gui_app = gui_app
+                self.buffer = ""
+                
+            def write(self, text):
+                # Write to original stdout first
+                self.gui_app.original_stdout.write(text)
+                
+                # Add to buffer
+                self.buffer += text
+                
+                # If we have a complete line, log it
+                if '\n' in self.buffer:
+                    lines = self.buffer.split('\n')
+                    # Log all complete lines
+                    for line in lines[:-1]:  # All but the last (incomplete) line
+                        if line.strip():  # Only log non-empty lines
+                            self.gui_app.log_console(line.strip())
+                    # Keep the incomplete line in buffer
+                    self.buffer = lines[-1]
+                    
+            def flush(self):
+                self.gui_app.original_stdout.flush()
+                
+        # Set up the redirector
+        self.console_redirector = ConsoleRedirector(self)
+        sys.stdout = self.console_redirector
+        
+    def update_vision(self, image):
+        """Update the current vision display with a PIL Image"""
+        try:
+            # Get the actual size of the vision canvas widget
+            canvas_width = self.vision_canvas.winfo_width()
+            canvas_height = self.vision_canvas.winfo_height()
+            
+            # If the canvas hasn't been rendered yet, use default sizes
+            if canvas_width <= 1 or canvas_height <= 1:
+                canvas_width = 600  # Larger default width
+                canvas_height = 400  # Larger default height
+            
+            # Calculate aspect ratio to maintain proportions
+            img_width, img_height = image.size
+            aspect_ratio = img_width / img_height
+            display_aspect = canvas_width / canvas_height
+            
+            # Log the image and display dimensions for debugging
+            self.log_system(f"Image size: {img_width}x{img_height}, Display size: {canvas_width}x{canvas_height}")
+            
+            if aspect_ratio > display_aspect:
+                # Image is wider than display area - fit to width
+                new_width = canvas_width
+                new_height = int(canvas_width / aspect_ratio)
+            else:
+                # Image is taller than display area - fit to height
+                new_height = canvas_height
+                new_width = int(canvas_height * aspect_ratio)
+            
+            # Resize the image
+            resized_image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+            
+            # Convert to PhotoImage for tkinter
+            photo_image = ImageTk.PhotoImage(resized_image)
+            
+            # Clear the canvas and display the new image
+            self.vision_canvas.delete("all")
+            
+            # Add the title text back
+            self.vision_canvas.create_text(canvas_width//2, 20, text="Vision Input", 
+                                          fill='white', font=('Arial', 12, 'bold'))
+            
+            # Calculate position to center the image
+            x_pos = (canvas_width - new_width) // 2
+            y_pos = (canvas_height - new_height) // 2 + 30  # Offset for title
+            
+            # Display the image on the canvas
+            self.vision_canvas.create_image(x_pos, y_pos, anchor='nw', image=photo_image)
+            
+            # Keep a reference to prevent garbage collection
+            self.vision_canvas.image = photo_image
+            
+        except Exception as e:
+            # Fallback to text if image display fails
+            self.vision_canvas.delete("all")
+            self.vision_canvas.create_text(300, 200, text=f"Vision Error: {str(e)}", 
+                                          fill='red', font=('Arial', 12))
+            self.log_system(f"Error updating vision display: {str(e)}")
+        
+    def update_prediction(self, image):
+        """Update the predicted vision display with a PIL Image"""
+        try:
+            # Get the actual size of the prediction canvas widget
+            canvas_width = self.prediction_canvas.winfo_width()
+            canvas_height = self.prediction_canvas.winfo_height()
+            
+            # If the canvas hasn't been rendered yet, use default sizes
+            if canvas_width <= 1 or canvas_height <= 1:
+                canvas_width = 600  # Larger default width
+                canvas_height = 400  # Larger default height
+            
+            # Calculate aspect ratio to maintain proportions
+            img_width, img_height = image.size
+            aspect_ratio = img_width / img_height
+            display_aspect = canvas_width / canvas_height
+            
+            if aspect_ratio > display_aspect:
+                # Image is wider than display area - fit to width
+                new_width = canvas_width
+                new_height = int(canvas_width / aspect_ratio)
+            else:
+                # Image is taller than display area - fit to height
+                new_height = canvas_height
+                new_width = int(canvas_height * aspect_ratio)
+            
+            # Resize the image
+            resized_image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+            
+            # Convert to PhotoImage for tkinter
+            photo_image = ImageTk.PhotoImage(resized_image)
+            
+            # Clear the canvas and display the new image
+            self.prediction_canvas.delete("all")
+            
+            # Add the title text back
+            self.prediction_canvas.create_text(canvas_width//2, 20, text="Prediction Output", 
+                                              fill='white', font=('Arial', 12, 'bold'))
+            
+            # Calculate position to center the image
+            x_pos = (canvas_width - new_width) // 2
+            y_pos = (canvas_height - new_height) // 2 + 30  # Offset for title
+            
+            # Display the image on the canvas
+            self.prediction_canvas.create_image(x_pos, y_pos, anchor='nw', image=photo_image)
+            
+            # Keep a reference to prevent garbage collection
+            self.prediction_canvas.image = photo_image
+            
+        except Exception as e:
+            # Fallback to text if image display fails
+            self.prediction_canvas.delete("all")
+            self.prediction_canvas.create_text(300, 200, text=f"Prediction Error: {str(e)}", 
+                                              fill='red', font=('Arial', 12))
+            self.log_system(f"Error updating prediction display: {str(e)}")
+        
+    def update_status(self, status_text):
+        """Update the internal state display"""
+        # Placeholder method - will be implemented later
+        pass
+    
+    def update_tps(self, tick_count):
+        """Update the TPS counter display"""
+        import time
+        
+        current_time = time.time()
+        
+        # Initialize start time if not set
+        if self.tps_start_time is None:
+            self.tps_start_time = current_time
+            self.tps_tick_count = 0
+        
+        # Update tick count
+        self.tps_tick_count = tick_count
+        
+        # Calculate current TPS
+        elapsed_time = current_time - self.tps_start_time
+        if elapsed_time > 0:
+            current_tps = self.tps_tick_count / elapsed_time
+        else:
+            current_tps = 0.0
+        
+        # Store in history for averaging (keep last 10 values)
+        self.tps_history.append(current_tps)
+        if len(self.tps_history) > 10:
+            self.tps_history.pop(0)
+        
+        # Calculate average TPS
+        if self.tps_history:
+            average_tps = sum(self.tps_history) / len(self.tps_history)
+        else:
+            average_tps = 0.0
+        
+        # Update display
+        tps_text = f"Current TPS: {current_tps:.1f}\n"
+        tps_text += f"Target TPS: {self.target_tps:.1f}\n"
+        tps_text += f"Average TPS: {average_tps:.1f}"
+        
+        # Color coding based on performance
+        if current_tps >= self.target_tps * 0.9:  # Within 90% of target
+            color = '#00FF00'  # Green
+        elif current_tps >= self.target_tps * 0.7:  # Within 70% of target
+            color = '#FFFF00'  # Yellow
+        else:
+            color = '#FF0000'  # Red
+        
+        self.tps_label.config(text=tps_text, fg=color)
+    
+    def update_prediction_error(self, error_value):
+        """Update the prediction error display"""
+        if error_value is None:
+            error_text = "Error: 0.000000\nStatus: No Data"
+            color = '#FFD700'  # Gold
+        else:
+            error_text = f"Error: {error_value:.6f}\nStatus: Active"
+            
+            # Color coding based on error magnitude
+            if error_value < 0.001:  # Very low error
+                color = '#00FF00'  # Green
+            elif error_value < 0.01:  # Low error
+                color = '#FFFF00'  # Yellow
+            elif error_value < 0.1:  # Medium error
+                color = '#FFA500'  # Orange
+            else:  # High error
+                color = '#FF0000'  # Red
+        
+        self.error_label.config(text=error_text, fg=color)
+    
+    def update_internal_state(self, internal_state, is_sleeping: bool):
+        """Update the Internal State panel (energy, comfort, drivers, and state)."""
+        try:
+            state_line = f"State: {'Sleeping' if is_sleeping else 'Awake'}"
+            energy = internal_state.get('Energy', 0.0)
+            comfort = internal_state.get('Comfort', 0.0)
+            novelty = internal_state.get('Novelty', 0.0)
+            boredom = internal_state.get('Boredom', 0.0)
+            # Confidence is currently static in UI
+            status_text = (
+                f"{state_line}\n"
+                f"---Constraints---\n"
+                f"Energy: {energy:.1f}\n"
+                f"Comfort: {comfort:.1f}\n"
+                f"Confidence: 50.0\n"
+                f"---Drivers---\n"
+                f"Novelty: {novelty:.6f}\n"
+                f"Boredom: {boredom:.1f}"
+            )
+            self.status_label.config(text=status_text)
+            
+            # Update reading button state
+            self.update_reading_button_state(internal_state)
+        except Exception as e:
+            self.log_system(f"Error updating internal state panel: {e}")
+    
+    def reset_tps_counter(self):
+        """Reset the TPS counter"""
+        self.tps_start_time = None
+        self.tps_tick_count = 0
+        self.tps_history.clear()
+        self.update_tps(0)
+        
+    def log_action(self, action_text):
+        """Add an action to the speech log (since action log was replaced)"""
+        self._add_to_log(self.speech_log, action_text)
+        
+    def log_system(self, system_text):
+        """Add a system message to the system log"""
+        self._add_to_log(self.system_log, system_text)
+        
+    def log_console(self, console_text):
+        """Add a message to the console log (mirrors console output)"""
+        self._add_to_log(self.console_log, console_text)
+        
+    def log_sensory_packet(self, packet_summary):
+        """Add a sensory packet summary to the sensory packet log"""
+        self._add_to_log(self.sensory_log, packet_summary)
+        
+    def log_thoughts(self, thought_text):
+        """Add an internal thought to the thoughts log"""
+        self._add_to_log(self.thoughts_log, thought_text)
+        
+    def log_speech(self, speech_text):
+        """Add speech output to the speech log"""
+        self._add_to_log(self.speech_log, speech_text)
+        
+
+        
+    def _add_to_log(self, text_widget, message):
+        """Helper method to add a message to any log widget"""
+        # Enable the text widget for editing
+        text_widget.config(state='normal')
+        
+        # Add timestamp and message
+        import datetime
+        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+        log_entry = f"[{timestamp}] {message}\n"
+        
+        # Insert at the end
+        text_widget.insert(tk.END, log_entry)
+        
+        # Scroll to the bottom
+        text_widget.see(tk.END)
+        
+        # Disable the text widget again
+        text_widget.config(state='disabled')
+        
+    def start_engine(self):
+        """Start the engine"""
+        if self.engine:
+            self.log_action("Start button clicked - starting engine")
+            # Test OLM dialog functionality
+            self.log_olm_dialog("Engine starting...")
+            self.engine.start()
+            self.start_button.config(state='disabled')
+            self.stop_button.config(state='normal')
+        else:
+            self.log_system("ERROR: No engine connected!")
+        
+    def stop_engine(self):
+        """Stop the engine"""
+        if self.engine:
+            self.log_action("Stop button clicked - stopping engine")
+            self.engine.stop()
+            self.start_button.config(state='normal')
+            self.stop_button.config(state='disabled')
+        else:
+            self.log_system("ERROR: No engine connected!")
+            
+    def wipe_checkpoints(self):
+        """Wipe the checkpoints directory"""
+        if self.engine:
+            self.log_action("Wipe button clicked - clearing checkpoints")
+            self.engine.wipe_checkpoints()
+        else:
+            self.log_system("ERROR: No engine connected!")
+    
+    def start_reading_session(self):
+        """Manually start a reading session"""
+        if self.engine:
+            self.log_system("Reading button clicked - starting reading session")
+            self.engine._start_reading_session()
+        else:
+            self.log_system("ERROR: No engine connected!")
+    
+    def update_reading_button_state(self, internal_state):
+        """Update the reading button state based on internal state constraints"""
+        if not self.engine:
+            return
+        
+        # Check if the engine is in a state where reading can be triggered
+        if (self.engine.is_sleeping or self.engine.is_reading):
+            # Disable button if sleeping or already reading
+            self.reading_button.config(state='disabled', bg='#666666')
+            return
+        
+        # Check the reading constraints
+        boredom = internal_state.get('Boredom', 0.0)
+        comfort = internal_state.get('Comfort', 0.0)
+        novelty = internal_state.get('Novelty', 0.0)
+        
+        # Update constraint labels with current values and colors
+        # Boredom constraint: > 80
+        boredom_met = boredom > 80
+        boredom_color = '#00FF00' if boredom_met else '#FF0000'  # Green if met, red if not
+        self.boredom_constraint_label.config(
+            text=f"Boredom > 80: {boredom:.1f}",
+            fg=boredom_color
+        )
+        
+        # Comfort constraint: > 60
+        comfort_met = comfort > 60
+        comfort_color = '#00FF00' if comfort_met else '#FF0000'  # Green if met, red if not
+        self.comfort_constraint_label.config(
+            text=f"Comfort > 60: {comfort:.1f}",
+            fg=comfort_color
+        )
+        
+        # Novelty constraint: < 17.1
+        novelty_met = novelty < 17.1
+        novelty_color = '#00FF00' if novelty_met else '#FF0000'  # Green if met, red if not
+        self.novelty_constraint_label.config(
+            text=f"Novelty < 17.1: {novelty:.1f}",
+            fg=novelty_color
+        )
+        
+        # Reading constraints: Boredom > 80, Comfort > 60, Novelty < 17.1
+        constraints_met = (boredom_met and comfort_met and novelty_met)
+        
+        if constraints_met:
+            # Enable button with purple color
+            self.reading_button.config(state='normal', bg='#9C27B0')
+        else:
+            # Disable button with gray color
+            self.reading_button.config(state='disabled', bg='#666666')
+            
+    def send_user_message(self):
+        """Send a user message to the engine's text handler"""
+        if self.engine:
+            # Get the text from the entry widget
+            text = self.user_input_entry.get().strip()
+            
+            if text:  # Only send if text is not empty
+                # Add the message to the engine's text handler
+                self.engine.text_handler.add_message(text, 'user')
+                
+                # Log the action
+                self.log_action(f"Sent user message: {text}")
+                
+                # Clear the entry widget
+                self.user_input_entry.delete(0, tk.END)
+            else:
+                # Log if user tried to send empty message
+                self.log_system("Attempted to send empty message - ignored")
+        else:
+            self.log_system("ERROR: No engine connected!")
+    
+    def update_token_counter(self, vocabulary_size=None, total_tokens=None, last_tokens=None):
+        """Update the token counter display with current tokenizer statistics"""
+        if vocabulary_size is None and self.engine and hasattr(self.engine, 'tokenizer'):
+            vocabulary_size = self.engine.tokenizer.get_vocabulary_size()
+        
+        if total_tokens is None and self.engine and hasattr(self.engine, 'tokenizer'):
+            # Count total tokens in vocabulary
+            total_tokens = sum(self.engine.tokenizer.word_to_token.values()) if hasattr(self.engine.tokenizer, 'word_to_token') else 0
+        
+        if last_tokens is None and self.engine and hasattr(self.engine, 'last_olm_speech_tokens'):
+            last_tokens = self.engine.last_olm_speech_tokens[-10:] if self.engine.last_olm_speech_tokens else []  # Last 10 tokens
+        
+        # Format the display text
+        vocab_text = f"Vocabulary Size: {vocabulary_size}" if vocabulary_size is not None else "Vocabulary Size: 0"
+        total_text = f"Total Tokens: {total_tokens}" if total_tokens is not None else "Total Tokens: 0"
+        
+        if last_tokens:
+            last_tokens_text = f"Last Tokens: {last_tokens}"
+        else:
+            last_tokens_text = "Last Tokens: None"
+        
+        self.token_counter_label.config(text=f"{vocab_text}\n{total_text}\n{last_tokens_text}")
+    
+    def toggle_dream_logging(self):
+        """Toggle the dream logging feature on/off"""
+        if self.engine:
+            self.engine.dream_log_enabled = self.dream_log_var.get()
+            status = "enabled" if self.dream_log_var.get() else "disabled"
+            self.log_system(f"Dream logging has been {status}.")
+        else:
+            self.log_system("ERROR: No engine connected!")
+    
+    def print_log_report(self):
+        """Generate and save a comprehensive log report for the current tick"""
+        if not self.engine:
+            self.log_system("ERROR: No engine connected!")
+            return
+        
+        try:
+            import os
+            import datetime
+            
+            # Create logs directory if it doesn't exist
+            logs_dir = "logs"
+            if not os.path.exists(logs_dir):
+                os.makedirs(logs_dir)
+                self.log_system(f"Created logs directory: {logs_dir}")
+            
+            # Generate timestamp for filename
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"olm_report_{timestamp}.txt"
+            filepath = os.path.join(logs_dir, filename)
+            
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write("=" * 80 + "\n")
+                f.write("OLM SYSTEM REPORT\n")
+                f.write("=" * 80 + "\n")
+                f.write(f"Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"Tick Count: {getattr(self.engine, 'tick_count', 'Unknown')}\n\n")
+                
+                # Internal State Section
+                f.write("-" * 40 + "\n")
+                f.write("INTERNAL STATE\n")
+                f.write("-" * 40 + "\n")
+                for key, value in self.engine.internal_state.items():
+                    f.write(f"{key}: {value}\n")
+                f.write(f"Sleeping: {self.engine.is_sleeping}\n")
+                f.write(f"Reading: {self.engine.is_reading}\n")
+                f.write(f"Energy: {self.engine.internal_state.get('Energy', 'Unknown')}\n\n")
+                
+                # Sensory Packet Section
+                f.write("-" * 40 + "\n")
+                f.write("CURRENT SENSORY PACKET\n")
+                f.write("-" * 40 + "\n")
+                if hasattr(self.engine, 'current_sensory_packet'):
+                    for key, value in self.engine.current_sensory_packet.items():
+                        if key == 'text' and isinstance(value, dict) and 'text' in value:
+                            # Handle tokenized text specially
+                            tokens = value['text']
+                            if isinstance(tokens, list):
+                                f.write(f"Text ({value.get('source', 'unknown')}): {len(tokens)} tokens\n")
+                                f.write(f"  Tokens: {tokens}\n")
+                            else:
+                                f.write(f"Text ({value.get('source', 'unknown')}): {tokens}\n")
+                        elif key == 'vision' and isinstance(value, dict):
+                            f.write(f"Vision: {value.get('image_size', 'Unknown size')}\n")
+                        elif key == 'keyboard' and isinstance(value, dict):
+                            events = value.get('events', [])
+                            f.write(f"Keyboard: {len(events)} events\n")
+                        elif key == 'lsh_hash':
+                            f.write(f"LSH Hash: {value[:16]}...\n")
+                        else:
+                            f.write(f"{key}: {value}\n")
+                else:
+                    f.write("No sensory packet available\n")
+                f.write("\n")
+                
+                # Tokenizer Section
+                f.write("-" * 40 + "\n")
+                f.write("TOKENIZER STATISTICS\n")
+                f.write("-" * 40 + "\n")
+                if hasattr(self.engine, 'tokenizer'):
+                    vocab_size = self.engine.tokenizer.get_vocabulary_size()
+                    f.write(f"Vocabulary Size: {vocab_size}\n")
+                    f.write(f"Last Speech Tokens: {getattr(self.engine, 'last_olm_speech_tokens', [])}\n")
+                    
+                    # Show some sample vocabulary entries
+                    if hasattr(self.engine.tokenizer, 'word_to_token'):
+                        sample_words = list(self.engine.tokenizer.word_to_token.keys())[:20]
+                        f.write(f"Sample Vocabulary: {sample_words}\n")
+                else:
+                    f.write("No tokenizer available\n")
+                f.write("\n")
+                
+                # Thought History Section
+                f.write("-" * 40 + "\n")
+                f.write("THOUGHT HISTORY\n")
+                f.write("-" * 40 + "\n")
+                if hasattr(self.engine, 'thought_history'):
+                    f.write(f"Thought History Length: {len(self.engine.thought_history)}\n")
+                    f.write(f"Consecutive Similar Thoughts: {getattr(self.engine, 'consecutive_similar_thoughts', 0)}\n")
+                else:
+                    f.write("No thought history available\n")
+                f.write("\n")
+                
+                # Experience Buffer Section
+                f.write("-" * 40 + "\n")
+                f.write("EXPERIENCE BUFFER\n")
+                f.write("-" * 40 + "\n")
+                if hasattr(self.engine, 'experience_buffer'):
+                    f.write(f"Experience Buffer Size: {len(self.engine.experience_buffer)}\n")
+                    f.write(f"Max Buffer Size: {getattr(self.engine, 'experience_buffer_max_size', 'Unknown')}\n")
+                else:
+                    f.write("No experience buffer available\n")
+                f.write("\n")
+                
+                # Hash Database Section
+                f.write("-" * 40 + "\n")
+                f.write("HASH DATABASE\n")
+                f.write("-" * 40 + "\n")
+                if hasattr(self.engine, 'hash_db'):
+                    f.write(f"Total Hashes: {len(self.engine.hash_db.hash_to_id)}\n")
+                    f.write(f"Last Hash: {getattr(self.engine, 'last_tick_hash', 'None')}\n")
+                else:
+                    f.write("No hash database available\n")
+                f.write("\n")
+                
+                # Prediction Section
+                f.write("-" * 40 + "\n")
+                f.write("PREDICTION STATE\n")
+                f.write("-" * 40 + "\n")
+                if hasattr(self.engine, 'prediction_from_previous_tick'):
+                    if self.engine.prediction_from_previous_tick is not None:
+                        f.write(f"Previous Prediction Shape: {self.engine.prediction_from_previous_tick.shape}\n")
+                        f.write(f"Previous Prediction Mean: {self.engine.prediction_from_previous_tick.mean():.6f}\n")
+                    else:
+                        f.write("No previous prediction available\n")
+                else:
+                    f.write("No prediction state available\n")
+                f.write("\n")
+                
+                # Reading State Section
+                if self.engine.is_reading:
+                    f.write("-" * 40 + "\n")
+                    f.write("READING STATE\n")
+                    f.write("-" * 40 + "\n")
+                    f.write(f"Current Book: {getattr(self.engine, 'current_book_path', 'Unknown')}\n")
+                    f.write(f"Book File Open: {getattr(self.engine, 'current_book_file', None) is not None}\n")
+                    f.write("\n")
+                
+                f.write("=" * 80 + "\n")
+                f.write("END OF REPORT\n")
+                f.write("=" * 80 + "\n")
+            
+            self.log_system(f"Log report saved to: {filepath}")
+            
+        except Exception as e:
+            error_msg = f"Error generating log report: {str(e)}"
+            self.log_system(error_msg)
+            print(error_msg)
+            
+    def on_closing(self):
+        """Handle window closing"""
+        # Restore original stdout
+        if hasattr(self, 'original_stdout'):
+            sys.stdout = self.original_stdout
+            
+        self.stop_engine()
+        self.root.destroy()
+        
+    def run(self):
+        """Start the GUI application"""
+        # Initially disable stop button
+        self.stop_button.config(state='disabled')
+        self.root.mainloop()
+
+
