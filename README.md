@@ -6,6 +6,10 @@
 - ✅ Added Hash Information Database for state tracking
 - ✅ Enhanced GUI with prediction error display and thought/speech logs
 - ✅ Updated engine with full sensory vector processing and internal state management
+- ✅ **MAJOR FIXES**: Resolved critical runtime errors in D-LSTM training
+- ✅ **PERFORMANCE**: Optimized energy consumption and novelty scaling
+- ✅ **BEHAVIORAL**: Added comfort regeneration during reading cycles
+- ✅ **CONSTRAINTS**: Fine-tuned reading triggers and cycle limits
 
 OLM Observer is a comprehensive artificial consciousness simulation system that implements a complete Observational Learning Model (OLM) pipeline. The system captures, processes, and analyzes multimodal input streams including vision, keyboard interactions, and text input through a sophisticated neural architecture that includes pattern recognition, neurotransmitter simulation, and dual-output processing for internal thoughts and external speech.
 
@@ -88,17 +92,26 @@ OLM Observer is a comprehensive artificial consciousness simulation system that 
 ```
 OLMV2/
 ├── main.py              # Application entry point
-├── engine.py            # Core processing engine
-├── gui.py               # Tkinter GUI interface
+├── engine.py            # Core processing engine with behavioral systems
+├── gui.py               # Tkinter GUI interface with constraint monitoring
 ├── beta_vae.py          # Beta-VAE implementation
 ├── screen_capture.py    # Screen capture functionality
 ├── tokenizer.py         # Custom tokenizer
 ├── lsh_system.py        # LSH implementation
 ├── keyboard_input.py    # Keyboard monitoring
 ├── text_input.py        # Text input handling
+├── prediction_model.py  # State prediction neural networks
+├── neuro_predictor.py   # Neurotransmitter prediction networks
+├── P_C_pipe.py          # Pattern recognition and neurotransmitter activation
+├── D_pipe.py            # Dual D-LSTM for thought and speech generation
+├── tinyllama_integration.py # External LLM integration
 ├── checkpoints/         # Persistent state storage
 │   ├── lsh_memory.pkl   # LSH system state
-│   └── tokenizer_vocab.pkl # Tokenizer vocabulary
+│   ├── tokenizer_vocab.pkl # Tokenizer vocabulary
+│   └── prediction_model.pth # State predictor weights
+├── books/               # Reading material directory
+├── logs/                # System reports and logs
+├── dream_logs/          # Sleep cycle dream logs
 └── requirements.txt     # Python dependencies
 ```
 
@@ -167,17 +180,26 @@ Comprehensive visualization system providing:
 - **Model Save Frequency**: Every 200 ticks (10 seconds)
 
 ### Neural Network Parameters
-- **Sensory Vector Size**: 163 (Vision:128 + Text:32 + Keyboard:3)
+- **Sensory Vector Size**: 195 (Vision:128 + Text:32 + Keyboard:3 + Previous Speech:32)
 - **Prediction LSTM Hidden Size**: 256
 - **Temporal Window**: 10 ticks for state prediction
 - **Pattern LSTM Hidden Size**: 256, Output Size: 128
 - **Neurotransmitter Vector Size**: 64
 - **D-LSTM Output Tokens**: 32 maximum
+- **Novelty Scaling Factor**: 10,000 (raw MSE → 0-100 behavioral range)
 
 ### LSH Parameters
 - **Latent Dimension**: 128 (matches VAE output)
 - **Number of Hashes**: 64 hyperplanes
 - **Hash Type**: Binary string representation
+
+### Behavioral System Parameters
+- **Internal State Drivers**: Energy, Comfort, Novelty, Boredom (0-100 range)
+- **Reading Constraints**: Boredom > 80, Comfort > 60, Novelty < 17.1
+- **Reading Limit**: Maximum 1 book per awake cycle
+- **Energy Consumption**: Speech (0.02/token), Thought (0.002), Decay (0.15)
+- **Comfort Dynamics**: Decay (-0.02/tick wake), Regeneration (+0.05/tick reading)
+- **Novelty Thresholds**: High (>100) resets boredom, Low (<50) increases boredom
 
 ### GUI Parameters
 - **Window Size**: 1200x800 (resizable, minimum 800x600)
@@ -185,6 +207,7 @@ Comprehensive visualization system providing:
 - **Vision Display**: Auto-scaling with aspect ratio preservation
 - **TPS Display**: Color-coded performance (Green/Yellow/Red)
 - **Prediction Error**: Color-coded novelty visualization
+- **Reading Constraints Display**: Real-time constraint monitoring with color coding
 
 ## Checkpoints and State Management
 

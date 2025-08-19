@@ -17,6 +17,9 @@ class App:
         
         # Create main window
         self.root = tk.Tk()
+        
+        # Dream logging control variable (must be created after root window)
+        self.dream_log_var = tk.BooleanVar(value=False)
         self.root.title("OLM Observer")
         self.root.configure(bg='#2b2b2b')  # Dark grey background
         
@@ -252,13 +255,13 @@ class App:
         self.boredom_constraint_label.pack(anchor='w')
         
         self.comfort_constraint_label = tk.Label(constraints_frame, 
-                                               text="Comfort > 70: 0.0", 
+                                               text="Comfort > 60: 0.0", 
                                                bg='#2b2b2b', fg='#FF0000',  # Red initially
                                                font=('Consolas', 8))
         self.comfort_constraint_label.pack(anchor='w')
         
         self.novelty_constraint_label = tk.Label(constraints_frame, 
-                                               text="Novelty < 0.001: 0.0", 
+                                               text="Novelty < 17.1: 0.0", 
                                                bg='#2b2b2b', fg='#FF0000',  # Red initially
                                                font=('Consolas', 8))
         self.novelty_constraint_label.pack(anchor='w')
@@ -283,6 +286,22 @@ class App:
                                           justify=tk.LEFT, anchor='nw',
                                           relief='solid', bd=1)
         self.token_counter_label.pack(fill='x', pady=(0, 5))
+        
+        # Dream logging checkbox frame
+        dream_log_frame = tk.Frame(sidebar_frame, bg='#2b2b2b')
+        dream_log_frame.pack(fill='x', padx=10, pady=(5, 5))
+        
+        # Dream logging checkbox
+        self.dream_log_checkbox = tk.Checkbutton(dream_log_frame, 
+                                                text="Enable Dream Logging",
+                                                variable=self.dream_log_var,
+                                                command=self.toggle_dream_logging,
+                                                bg='#2b2b2b', fg='white',
+                                                selectcolor='#1e1e1e',
+                                                font=('Arial', 10),
+                                                activebackground='#2b2b2b',
+                                                activeforeground='white')
+        self.dream_log_checkbox.pack(anchor='w')
         
         # Print log button frame
         log_frame = tk.Frame(sidebar_frame, bg='#2b2b2b')
@@ -325,14 +344,21 @@ class App:
     def log_olm_dialog(self, message: str):
         """Append a line to the OLM dialog container."""
         try:
-            self.olm_dialog_text.config(state='normal')
-            import datetime
-            timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-            self.olm_dialog_text.insert(tk.END, f"[{timestamp}] {message}\n")
-            self.olm_dialog_text.see(tk.END)
-            self.olm_dialog_text.config(state='disabled')
-        except Exception:
-            pass
+            if hasattr(self, 'olm_dialog_text') and self.olm_dialog_text:
+                self.olm_dialog_text.config(state='normal')
+                import datetime
+                timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+                self.olm_dialog_text.insert(tk.END, f"[{timestamp}] {message}\n")
+                self.olm_dialog_text.see(tk.END)
+                self.olm_dialog_text.config(state='disabled')
+            else:
+                # Fallback to system log if OLM dialog widget is not available
+                self.log_system(f"OLM Dialog: {message}")
+        except Exception as e:
+            # Log the error to system log instead of silently failing
+            self.log_system(f"Error in log_olm_dialog: {str(e)}")
+            # Also try to log the original message to system log
+            self.log_system(f"OLM Dialog (fallback): {message}")
         
     def setup_bottom_section(self):
         """Create the bottom section with five log panels"""
@@ -699,6 +725,8 @@ class App:
         """Start the engine"""
         if self.engine:
             self.log_action("Start button clicked - starting engine")
+            # Test OLM dialog functionality
+            self.log_olm_dialog("Engine starting...")
             self.engine.start()
             self.start_button.config(state='disabled')
             self.stop_button.config(state='normal')
@@ -756,23 +784,23 @@ class App:
             fg=boredom_color
         )
         
-        # Comfort constraint: > 70
-        comfort_met = comfort > 70
+        # Comfort constraint: > 60
+        comfort_met = comfort > 60
         comfort_color = '#00FF00' if comfort_met else '#FF0000'  # Green if met, red if not
         self.comfort_constraint_label.config(
-            text=f"Comfort > 70: {comfort:.1f}",
+            text=f"Comfort > 60: {comfort:.1f}",
             fg=comfort_color
         )
         
-        # Novelty constraint: < 0.001
-        novelty_met = novelty < 0.001
+        # Novelty constraint: < 17.1
+        novelty_met = novelty < 17.1
         novelty_color = '#00FF00' if novelty_met else '#FF0000'  # Green if met, red if not
         self.novelty_constraint_label.config(
-            text=f"Novelty < 0.001: {novelty:.6f}",
+            text=f"Novelty < 17.1: {novelty:.1f}",
             fg=novelty_color
         )
         
-        # Reading constraints: Boredom > 80, Comfort > 70, Novelty < 0.001
+        # Reading constraints: Boredom > 80, Comfort > 60, Novelty < 17.1
         constraints_met = (boredom_met and comfort_met and novelty_met)
         
         if constraints_met:
@@ -825,6 +853,15 @@ class App:
             last_tokens_text = "Last Tokens: None"
         
         self.token_counter_label.config(text=f"{vocab_text}\n{total_text}\n{last_tokens_text}")
+    
+    def toggle_dream_logging(self):
+        """Toggle the dream logging feature on/off"""
+        if self.engine:
+            self.engine.dream_log_enabled = self.dream_log_var.get()
+            status = "enabled" if self.dream_log_var.get() else "disabled"
+            self.log_system(f"Dream logging has been {status}.")
+        else:
+            self.log_system("ERROR: No engine connected!")
     
     def print_log_report(self):
         """Generate and save a comprehensive log report for the current tick"""
@@ -990,16 +1027,4 @@ class App:
         self.stop_button.config(state='disabled')
         self.root.mainloop()
 
-if __name__ == "__main__":
-    # Create engine instance
-    from engine import Engine
-    engine = Engine()
-    
-    # Create GUI instance with engine reference
-    app = App(engine)
-    
-    # Connect GUI back to engine
-    engine.gui = app
-    
-    # Start the application
-    app.run()
+

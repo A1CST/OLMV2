@@ -30,6 +30,7 @@ class TinyLlamaManager:
         while True:
             input_text = self.request_queue.get()
             if input_text is None:  # Shutdown signal
+                print('[TinyLlama] Worker thread has gracefully shut down.')
                 break
             
             # --- REAL MODEL INFERENCE ---
@@ -85,6 +86,17 @@ class TinyLlamaManager:
 
     def stop(self):
         """Stops the worker thread."""
+        # Purge the backlog: Clear the queue of any pending prompts
+        while not self.request_queue.empty():
+            try:
+                self.request_queue.get_nowait()
+            except queue.Empty:
+                break
+        
+        # Signal the stop: Place the None sentinel into the now-empty queue
         self.request_queue.put(None)
+        
+        # Wait for confirmation: Force the main thread to wait until the worker thread has completely finished its execution
+        self.worker_thread.join(timeout=2.0)
 
 
